@@ -15,7 +15,12 @@ module top #(
   input  logic                   RST_N,    // reset (active low)
   input  logic                   EN,       // enable
   input  logic [    N-1:0][63:0] ARRAY_IN, // array inputs (N * 8 bytes)
-  output logic [BANKS-1:0][63:0] ARRAY_OUT // array outputs (BANKS * 8 bytes)
+  output logic [BANKS-1:0][63:0] ARRAY_OUT, // array outputs (BANKS * 8 bytes)
+
+  // measurement counters
+  output logic [31:0]            stall_count,
+  output logic [31:0]            active_count
+
 );
   /* TODO:
   - investigate controls / stall counter
@@ -23,26 +28,72 @@ module top #(
   - wire up modules with generate loops
   */
   // internal signals
+  localparam ADDR_WIDTH = $clog2(N);
+
+  logic [ADDR_WIDTH-1:0] sram_addr;
+  logic                  sram_en;
+
   logic [BANKS-1:0][63:0]        weights;
-  logic [BANKS-1:0][N-1:0][63:0] array_wires;
+  logic [BANKS-1:0]       weight_valid;
+
+  logic all_weights_valid;
+  logic stall;
+  logic mac_en;
+
+  // N MAC stages need N+1 to include initial 0
+  logic [BANKS-1:0][N:0][63:0] partial_sums; //renamed from array_wires to be more clear
 
   //-------------------------------------------------------------------------//
-  // TBD controller
+  // controller
   //-------------------------------------------------------------------------//
 
+  assign sram_en = EN; 
+  assign all_weights_valid = &weight_valid;
+
+  assign stall  = EN && !all_weights_valid;
+  assign mac_en = EN && all_weights_valid;
+
+  // address advances for each SRAM read
+  always_ff @(posedge CLK or negedge RST_N) begin
+    if (!RST_N) begin
+      sram_addr <= '0;
+    end else if (sram_en) begin
+      if (sram_addr == N-1)
+        sram_addr <= '0;
+      else
+        sram_addr <= sram_addr + 1'b1;
+    end
+  end
+
+
+  always_ff @(posedge CLK or negedge RST_N) begin
+    if (!RST_N) begin
+      stall_count  <= '0;
+      active_count <= '0;
+    end else if (EN) begin
+      if (stall)
+        stall_count <= stall_count + 1'b1; //count for stalled cycles
+      else
+        active_count <= active_count + 1'b1; //count for active cycles
+    end
+  end
 
   //-------------------------------------------------------------------------//
   // generate BANKS number of SRAM banks, N * BANKS number of MAC blocks
   //-------------------------------------------------------------------------//
   for (genvar i; i < BANKS; i++) begin 
+    assign partial_sums[i][0] = 64'b0;
+
     sram_bank #(
       .NUM_WORDS (N),    // address width
       .NUM_BYTES (8)     // data width (bytes)  
     ) sram_bank_u (   
       .CLK  (CLK),       // clock
-      .EN   (/* TBD */), // enable
-      .ADDR (/* TBD */), // read address
-      .DATA (weights[i])  // read data
+      .RST_N (RST_N),    // reset
+      .EN   (sram_en), // enable
+      .ADDR (sram_addr), // read address
+      .DATA (weights[i]),  // read data
+      .DATA_VALID(weight_valid[i])
     );
 
     // assign first row Y_IN to zero
@@ -54,16 +105,16 @@ module top #(
       ) mac_u (   
         .CLK   (CLK),       // clock
         .RST_N (RST_N),     // reset (active low)
-        .EN    (/* TBD */), // enable
+        .EN    (mac_en), // enable
         .X_IN  (ARRAY_IN[j]), // input data
         .W_IN  (weights[i]), // weight
-        .Y_IN  (array_wires[i][j]), // partial sum
-        .Y_OUT (/* TBD */)  // output data
+        .Y_IN  (partial_sums[i][j]), // partial sum
+        .Y_OUT (partial_sums[i][j+1])  // output data
       );
     end
 
     // assign array output to last row
-    assign ARRAY_OUT[i] = array_wires[i][N-1];
+    assign ARRAY_OUT[i] = partial_sums[i][N];
   end
 
 endmodule : top
