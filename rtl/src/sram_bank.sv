@@ -9,26 +9,37 @@
 //---------------------------------------------------------------------------//
 module sram_bank #(
   parameter NUM_WORDS = 8,  // address width
-  parameter NUM_BYTES = 64, // data width (bytes)  
+  parameter WORD_WIDTH = 64, // data width (bytes) 
+  parameter integer ADDR_WIDTH = (NUM_WORDS > 1) ? $clog2(NUM_WORDS) : 1 
 )(   
   input  logic                   CLK,  // clock
   input  logic                   RST_N,
-  input  logic                   EN,   // enable
-  input  logic [  NUM_WORDS-1:0] ADDR, // read address
-  output logic [8*NUM_BYTES-1:0] DATA,  // read data
-  output logic DATA_VALID
+  input  logic                   WR_EN,   // enable
+  input  logic [ADDR_WIDTH-1:0] WR_ADDR,
+  input  logic [WORD_WIDTH-1:0] WR_DATA,
+  
+  input  logic                  RD_EN,
+  input  logic [ADDR_WIDTH-1:0] RD_ADDR,
+  output logic [WORD_WIDTH-1:0] RD_DATA,
+  output logic                  RD_VALID
 );
-  // memory array
-  (* ram_style = block *) logic [8*NUM_BYTES-1:0] memory [NUM_WORDS-1:0];
+  logic [WORD_WIDTH-1:0] memory [0:NUM_WORDS-1];
+
+  // write channel
+  always_ff @(posedge CLK) begin
+        if (WR_EN)
+            memory[WR_ADDR] <= WR_DATA;
+    end
 
   // read channel
   always_ff @(posedge CLK or negedge RST_N) begin
     if (!RST_N) begin
-      DATA_VALID <= 1'b0;
+      RD_DATA  <= '0;
+      RD_VALID <= 1'b0;
     end else begin
-      DATA_VALID <= EN;
-      if (EN) begin
-        DATA <= memory[ADDR];
+      RD_VALID <= RD_EN;
+      if (RD_EN) begin
+        RD_DATA <= memory[RD_ADDR];
       end
     end
   end
