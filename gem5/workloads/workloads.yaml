@@ -1,0 +1,96 @@
+# EEL5764 Group 4 -- workload definitions (single source of truth).
+#
+# Every workload is one INT8 GEMM with INT32 accumulation:
+#     C[M x N_out] = A[M x K] . W[K x N_out]
+# M is the reuse factor of eq. (1): the activation rows streamed through
+# one N x N weight tile before the next tile is loaded.
+#
+# gen_workloads.py reads this file.  See README.txt for where each shape
+# comes from and why it was chosen.
+
+seed: 5764
+
+# Reduced-size variant for RTL simulation and gem5<->RTL cross-validation.
+# M (the reuse) is kept; K and N_out are capped so the RTL simulates in
+# seconds.  96 = lcm(8, 16, 24, 32), so no tile is padded for any swept N
+# unless the full dimension is smaller than 96.
+rtl_reduced:
+  max_k: 96
+  max_n_out: 96
+
+workloads:
+
+  resnet50_conv3x:
+    class: compute-bound
+    M: 784        # 28 x 28 output pixels (im2col rows)
+    K: 1152       # 3 x 3 x 128 (im2col columns: kernel window x C_in)
+    N_out: 128    # C_out
+    kind: conv_im2col
+    conv:
+      H: 28
+      W: 28
+      C_in: 128
+      C_out: 128
+      R: 3
+      S: 3
+      stride: 1
+      pad: 1
+    layer: >-
+      ResNet-50 stage conv3_x, 3x3 convolution of a bottleneck block that
+      is not the first of the stage (blocks 2-4), so input and output are
+      both 28x28x128 with stride 1 and pad 1.
+    source: >-
+      K. He, X. Zhang, S. Ren, J. Sun, "Deep Residual Learning for Image
+      Recognition," CVPR 2016, Table 1 (50-layer column, conv3_x row).
+
+  bert_ffn1:
+    class: compute-bound
+    M: 128        # sequence length (tokens)
+    K: 768        # hidden size H
+    N_out: 3072   # feed-forward (intermediate) size 4H
+    kind: gemm
+    layer: >-
+      BERT-base encoder feed-forward, first linear layer (H -> 4H), one
+      sequence of 128 tokens.
+    source: >-
+      J. Devlin, M.-W. Chang, K. Lee, K. Toutanova, "BERT: Pre-training of
+      Deep Bidirectional Transformers for Language Understanding," NAACL
+      2019, Sec. 3 (BERT-base L=12, H=768, A=12, FFN = 4H = 3072) and
+      Sec. A.2 (sequence length 128 for 90% of pre-training steps).
+
+  bert_attn_qk:
+    class: intermediate
+    M: 128        # query tokens
+    K: 64         # head dimension d_k = H / A = 768 / 12
+    N_out: 128    # key tokens
+    kind: attention_qk
+    layer: >-
+      BERT-base self-attention score matrix Q . K^T for one head, sequence
+      length 128 (A = Q_h, W = K_h^T).
+    source: >-
+      Devlin et al. 2019 (H=768, A=12 heads); A. Vaswani et al., "Attention
+      Is All You Need," NeurIPS 2017, Sec. 3.2.1-3.2.2 (d_k = d_model / h).
+
+  llama7b_gemv:
+    class: memory-bound
+    M: 1          # one token per decode step
+    K: 4096       # model dimension
+    N_out: 4096   # one attention projection (e.g. W_q) is 4096 x 4096
+    kind: gemv
+    layer: >-
+      LLaMA-7B autoregressive decode, one attention projection (W_q) for a
+      single new token (batch 1): y[1 x 4096] = x[1 x 4096] . W[4096 x 4096].
+    source: >-
+      H. Touvron et al., "LLaMA: Open and Efficient Foundation Language
+      Models," arXiv:2302.13971, 2023, Table 2 (6.7B model: dimension 4096,
+      32 heads, 32 layers).
+
+# Synthetic GEMMs for the reuse sweep (proposal II.C: "how does utilization
+# move with data reuse M?").  One workload per M, all K = N_out = 1024
+# (1 MiB of weights, so start-up effects such as weight prefetch during
+# the A load are negligible and the steady state of eq. (1) is measured).
+# Named reuse_M<M>; random data like the others.  Not a published layer.
+reuse_sweep:
+  M: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+  K: 1024
+  N_out: 1024

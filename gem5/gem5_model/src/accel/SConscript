@@ -1,0 +1,8 @@
+# EEL5764 Group 4 -- SystolicAccel SimObject (built via EXTRAS=...)
+Import("*")
+
+SimObject("SystolicAccel.py", sim_objects=["SystolicAccel"])
+Source("systolic_accel.cc")
+
+DebugFlag("SystolicAccel", "Weight-stationary systolic array accelerator")
+DebugFlag("SystolicAccelDma", "SystolicAccel DRAM->scratchpad weight DMA")

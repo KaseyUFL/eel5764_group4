@@ -1,0 +1,6 @@
+# LF line endings everywhere, so the shell scripts also work when the
+# repository is cloned on Windows and used from WSL.
+* text=auto eol=lf
+*.pdf binary
+*.png binary
+*.xlsx binary
