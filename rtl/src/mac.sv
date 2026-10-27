@@ -23,7 +23,7 @@ module mac #(
     if (!RST_N) begin
       Y_OUT <= 0;
     end else if (EN) begin
-      Y_OUT <= Y_IN + (W_IN * X_IN);
+      Y_OUT <= Y_IN + ($signed(W_IN) * $signed(X_IN));
     end
   end
 
