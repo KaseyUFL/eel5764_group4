@@ -44,13 +44,22 @@ for p in "$SYSTOLIC_ROOT"/gem5_model/patches/*.patch; do
 done
 
 JOBS="${BUILD_JOBS:-$(( $(nproc) > 2 ? $(nproc) - 2 : 1 ))}"
-if declare -F gem5_build_env >/dev/null; then
-    gem5_build_env           # from env.local.sh
-fi
+# Compilers and Python: env.local.sh's gem5_build_env, else the system
+# toolchain (an active conda environment is ignored; see env.sh).
+gem5_toolchain
+echo "toolchain: $GEM5_TOOLCHAIN"
 cd "$GEM5_DIR"
 if [ ! -f build/RISCV_SYSTOLIC/gem5.build/config ]; then
     scons --ignore-style defconfig build/RISCV_SYSTOLIC build_opts/RISCV
 fi
 scons --ignore-style build/RISCV_SYSTOLIC/gem5.opt \
     EXTRAS="$SYSTOLIC_ROOT/gem5_model/src" -j"$JOBS"
+if [ ! -x "$GEM5_BIN" ]; then
+    # scons can report success without linking after an interrupted or
+    # overlapping build (two builds in one checkout corrupt its state).
+    echo "error: scons finished but $GEM5_BIN does not exist." >&2
+    echo "  Make sure no other build is running in this checkout, then:" >&2
+    echo "  rm -rf $GEM5_DIR/build/RISCV_SYSTOLIC && make gem5" >&2
+    exit 1
+fi
 echo "built $GEM5_BIN"

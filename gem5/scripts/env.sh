@@ -46,3 +46,62 @@ export CHECK_REF="${CHECK_REF:-}"
 _n="$(nproc 2>/dev/null || echo 2)"
 export SIM_JOBS="${SIM_JOBS:-$(( _n > 14 ? 12 : (_n > 2 ? _n - 2 : 1) ))}"
 unset _n
+
+# ---------------------------------------------------------------- helpers
+# Used by build_gem5.sh, build_host.sh and check_deps.sh, so the check
+# tests exactly what the build uses.
+
+# gem5_toolchain: switch this shell to the compilers and Python that gem5
+# is built with.  Sets GEM5_TOOLCHAIN to a description.
+#   * env.local.sh defines gem5_build_env  -> that function
+#   * a conda environment is active          -> system toolchain; conda's
+#     directories are dropped from PATH (its python3-config makes gem5
+#     link a libpython the loader cannot find)
+#   * otherwise                              -> system toolchain
+gem5_toolchain() {
+    if declare -F gem5_build_env >/dev/null; then
+        gem5_build_env
+        GEM5_TOOLCHAIN="gem5_build_env from env.local.sh"
+    elif [ -n "${CONDA_EXE:-}${CONDA_PREFIX:-}" ]; then
+        local root="${CONDA_EXE:+$(dirname "$(dirname "$CONDA_EXE")")}"
+        root="${root:-$CONDA_PREFIX}"
+        PATH="$(printf '%s' "$PATH" | tr ':' '\n' |
+                awk -v p="$root" 'index($0, p) != 1' | paste -sd: -)"
+        export PATH
+        unset CONDA_PREFIX CONDA_DEFAULT_ENV PYTHONHOME PYTHONPATH
+        hash -r
+        GEM5_TOOLCHAIN="system (active conda environment ignored)"
+    else
+        GEM5_TOOLCHAIN="system"
+    fi
+}
+
+# find_riscv_cc: the RISC-V Linux C compiler for the host program, first
+# match wins.  Sets the array RISCV_CC_CMD and RISCV_CC_DESC; returns 1 if
+# there is none.
+_zig_venv() {
+    [ -x "$1/bin/python" ] && "$1/bin/python" -m ziglang version \
+        >/dev/null 2>&1
+}
+find_riscv_cc() {
+    if [ -n "${RISCV_CC:-}" ]; then
+        read -r -a RISCV_CC_CMD <<< "$RISCV_CC"
+        RISCV_CC_DESC="RISCV_CC=$RISCV_CC"
+    elif command -v riscv64-linux-gnu-gcc >/dev/null; then
+        RISCV_CC_CMD=(riscv64-linux-gnu-gcc -march=rv64gc
+                      -fno-tree-loop-distribute-patterns)
+        RISCV_CC_DESC="riscv64-linux-gnu-gcc"
+    elif _zig_venv "$SYSTOLIC_ROOT/third_party/zig-venv"; then
+        RISCV_CC_CMD=("$SYSTOLIC_ROOT/third_party/zig-venv/bin/python"
+                      -m ziglang cc -target riscv64-linux-musl)
+        RISCV_CC_DESC="zig $("${RISCV_CC_CMD[0]}" -m ziglang version)"
+        RISCV_CC_DESC+=" (third_party/zig-venv)"
+    elif _zig_venv "$HOME/riscv-tools/venv"; then
+        RISCV_CC_CMD=("$HOME/riscv-tools/venv/bin/python"
+                      -m ziglang cc -target riscv64-linux-musl)
+        RISCV_CC_DESC="zig $("${RISCV_CC_CMD[0]}" -m ziglang version)"
+        RISCV_CC_DESC+=" (~/riscv-tools/venv)"
+    else
+        return 1
+    fi
+}

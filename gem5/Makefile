@@ -40,7 +40,7 @@ PLOTS ?=
 FORCE ?=
 REF ?=
 
-.PHONY: help all venv build gem5 host zig workloads smoke run list data \
+.PHONY: help all deps venv build gem5 host zig workloads smoke run list data \
         figures model check clean distclean
 
 help:  ## this list
@@ -55,7 +55,7 @@ help:  ## this list
 	@echo "  make figures PLOTS='fig1 fig17 tables'"
 	@echo "  make check REF=path/to/other/results"
 
-all: build data figures  ## everything: build, simulate (about 1 h), plot
+all: deps build data figures  ## everything: check, build, simulate (about 1 h), plot
 
 venv:  ## Python packages (requirements.txt) in .venv, used automatically
 	cd $(ROOT); python3 -m venv .venv; \
@@ -63,13 +63,21 @@ venv:  ## Python packages (requirements.txt) in .venv, used automatically
 	    .venv/bin/pip install --quiet --disable-pip-version-check -r requirements.txt; \
 	    echo "installed requirements.txt into .venv ($$(.venv/bin/python3 -V))"
 
-build: gem5 host workloads  ## gem5 + host program + workloads
+deps:  ## check that every tool and package is installed (seconds)
+	$(ENV) bash scripts/check_deps.sh
+
+build: $(GEM5_BIN) host workloads  ## gem5 (if not built yet) + host program + workloads
 
 gem5:  ## fetch gem5 v25.1.0.1, apply the patch, build gem5.opt (20-30 min once)
-	$(ENV) bash scripts/build_gem5.sh
+	$(ENV) bash scripts/check_deps.sh --build && bash scripts/build_gem5.sh
 
-$(GEM5_BIN):
-	$(ENV) bash scripts/build_gem5.sh
+# Built when missing or older than the accelerator's sources; make gem5
+# always runs scons.
+ACCEL_SRC := $(wildcard $(ROOT)/gem5_model/src/accel/*) \
+             $(wildcard $(ROOT)/gem5_model/patches/*.patch)
+$(GEM5_BIN): $(ACCEL_SRC)
+	$(ENV) bash scripts/check_deps.sh --build && bash scripts/build_gem5.sh \
+	    && touch "$@"
 
 host: $(HOST_BIN)  ## cross-compile the RISC-V host program
 

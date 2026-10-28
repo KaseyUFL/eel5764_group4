@@ -21,27 +21,12 @@ OUT="$HOST_BIN"
 # loaded code and data do not).  Drop -s for symbol names in Exec traces.
 FLAGS=(-O2 -static -s -Wall -Wextra -fno-builtin-memcpy -fno-builtin-memset)
 
-zig_cc() {   # zig_cc VENV: the zig C compiler from a venv, if it has one
-    [ -x "$1/bin/python" ] && "$1/bin/python" -m ziglang version \
-        >/dev/null 2>&1
-}
-if [ -n "${RISCV_CC:-}" ]; then
-    read -r -a CC <<< "$RISCV_CC"
-elif command -v riscv64-linux-gnu-gcc >/dev/null; then
-    CC=(riscv64-linux-gnu-gcc -march=rv64gc
-        -fno-tree-loop-distribute-patterns)
-elif zig_cc "$SYSTOLIC_ROOT/third_party/zig-venv"; then
-    CC=("$SYSTOLIC_ROOT/third_party/zig-venv/bin/python" -m ziglang cc
-        -target riscv64-linux-musl)
-elif zig_cc "$HOME/riscv-tools/venv"; then
-    CC=("$HOME/riscv-tools/venv/bin/python" -m ziglang cc
-        -target riscv64-linux-musl)
-else
+if ! find_riscv_cc; then     # env.sh
     echo "No RISC-V compiler found. Either:" >&2
     echo "  make zig     (pip-installs zig into third_party/zig-venv)" >&2
     echo "  sudo apt install gcc-riscv64-linux-gnu" >&2
     exit 1
 fi
 mkdir -p "$(dirname "$OUT")"
-"${CC[@]}" "${FLAGS[@]}" -o "$OUT" "$SRC"
+"${RISCV_CC_CMD[@]}" "${FLAGS[@]}" -o "$OUT" "$SRC"
 echo "built $OUT ($(file -b "$OUT" | cut -d, -f1-2))"

@@ -152,6 +152,10 @@ headers, scons and a GCC 11–14. Point the `gem5_build_env` function in
 `env.local.sh` at it (step 3). The published results were built this
 way; see `env.local.sh.example`.
 
+**If your prompt shows a conda environment** such as `(base)`, that's
+fine. Without a `gem5_build_env` function, `make gem5` ignores conda and
+builds with the system packages from this step.
+
 ### 2. Get this folder
 
 ```bash
@@ -193,6 +197,36 @@ uses automatically. Ubuntu 24.04 refuses a plain `pip install` outside a
 virtual environment. The versions are pinned to the ones the results were
 made with, so a rerun reproduces `results/` byte for byte. To use another
 Python instead, set `PYTHON` in `env.local.sh`.
+
+### 4b. Check the dependencies
+
+```bash
+make deps
+```
+
+This takes a few seconds and checks everything the build and the
+experiments need: the compiler, scons, m4, git and zlib for gem5; that
+gem5's Python actually compiles and runs; disk and memory; the gem5
+checkout, its patch and its build; the RISC-V compiler; and the Python
+packages. Each line reads `ok`, `todo` (not built yet; the make target in
+brackets creates it), `warn` (works, but differs from the setup the
+results came from) or `MISSING`, followed by the command that fixes it:
+
+```
+Building gem5 (toolchain: system (active conda environment ignored))
+  ok       g++ 13.3.0 (gem5 supports GCC 11-14)
+  ok       Python 3.12 for gem5 (headers and libpython work)
+  ...
+gem5
+  todo     gem5.opt not built yet [make gem5, 20-30 min]
+RISC-V host program
+  MISSING  RISC-V Linux C compiler
+             fix: make zig   (no sudo)
+```
+
+`make all` runs this check first, and `make gem5` runs its gem5 part, so a
+missing dependency stops the run in seconds instead of minutes into the
+gem5 build.
 
 ### 5. Configure and build gem5 for this folder
 
@@ -329,8 +363,9 @@ for example the copy that went into the project documents. Set
 * With the pinned versions from `make venv`, a rerun rewrites every file
   byte-for-byte; `diff -r` against the reference then prints nothing.
 
-To do steps 5 to 11 in one go after the setup, run `make all` (about
-1.5 hours from scratch).
+To do steps 4b to 11 in one go after the setup, run `make all`. It
+starts with `make deps` and stops there if anything is missing; a full run
+from scratch takes about 1.5 hours. An existing gem5 build is reused.
 
 ## Make targets
 
@@ -338,8 +373,9 @@ To do steps 5 to 11 in one go after the setup, run `make all` (about
 | :--- | :--- |
 | `make help` | list the targets and examples |
 | `make venv` | install `requirements.txt` into `.venv` |
-| `make all` | `build`, `data`, `figures` |
-| `make build` | `gem5`, `host`, `workloads` |
+| `make deps` | check that every tool and package is installed (seconds) |
+| `make all` | `deps`, `build`, `data`, `figures` |
+| `make build` | gem5 (only if not built yet, or the accelerator's sources changed), `host`, `workloads` |
 | `make gem5` | clone (if needed), patch and build gem5 with the accelerator |
 | `make zig` | install zig 0.16.0 into `third_party/zig-venv` |
 | `make host` | cross-compile the RISC-V host program |
@@ -392,7 +428,7 @@ The results depend on:
 
 | Symptom | Fix |
 | :--- | :--- |
-| scons: `Can't find a working Python installation` | `python3-dev` is missing, or gem5 finds the wrong `python3-config`. Install it (step 1) or set up `gem5_build_env` (step 3). |
+| scons: `Can't find a working Python installation` | `python3-dev` is missing (install it, step 1), or gem5 picked up a conda Python whose `libpython` the loader cannot find. `make gem5` ignores an active conda environment unless `env.local.sh` defines `gem5_build_env` (step 3); if that function exists, check that it points at a working environment. After fixing, delete `$GEM5_DIR/build/RISCV_SYSTOLIC` so scons re-runs its checks. |
 | Build stops with `Killed signal terminated program cc1plus` | WSL ran out of memory. Run `make gem5 BUILD_JOBS=8`, or raise WSL's memory in `%UserProfile%\.wslconfig` (`[wsl2]` then `memory=12GB`), then run `wsl --shutdown` in PowerShell. |
 | `error: externally-managed-environment` from pip | Use `make venv` (step 4). |
 | `ensurepip is not available` | `sudo apt install python3-venv` |
