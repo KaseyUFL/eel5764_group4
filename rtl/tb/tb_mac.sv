@@ -1,19 +1,18 @@
 `timescale 1ns/1ps
 
 module tb_mac;
-    localparam integer NUM_BYTES = 8;
 
     logic CLK = 1'b0;
     logic RST_N;
     logic EN;
-    logic [8*NUM_BYTES-1:0] X_IN;
-    logic [8*NUM_BYTES-1:0] W_IN;
-    logic [8*NUM_BYTES-1:0] Y_IN;
-    logic [8*NUM_BYTES-1:0] Y_OUT;
+    logic [7:0] X_IN;
+    logic [7:0] W_IN;
+    logic [7:0] Y_IN;
+    logic [7:0] Y_OUT;
 
     always #5 CLK = ~CLK;
 
-    mac #(.NUM_BYTES(NUM_BYTES)) dut (
+    mac dut (
         .CLK(CLK),
         .RST_N(RST_N),
         .EN(EN),
@@ -24,7 +23,7 @@ module tb_mac;
     );
 
     task automatic check_output(
-        input logic [8*NUM_BYTES-1:0] expected,
+        input logic [7:0] expected,
         input string test_name
     );
         if (Y_OUT !== expected)
@@ -47,29 +46,29 @@ module tb_mac;
         // Basic arithmetic check: 2 * 3 + 4 = 10.
         @(negedge CLK);
         EN = 1'b1;
-        X_IN = 64'd2;
-        W_IN = 64'd3;
-        Y_IN = 64'd4;
+        X_IN = 8'd2;
+        W_IN = 8'd3;
+        Y_IN = 8'd4;
         @(posedge CLK); #1;
-        check_output(64'd10, "basic multiply-accumulate");
+        check_output(8'd10, "basic multiply-accumulate");
 
         // Check that EN=0 holds the registered output.
         @(negedge CLK);
         EN = 1'b0;
-        X_IN = 64'd100;
-        W_IN = 64'd100;
-        Y_IN = 64'd100;
+        X_IN = 8'd100;
+        W_IN = 8'd100;
+        Y_IN = 8'd100;
         @(posedge CLK); #1;
-        check_output(64'd10, "output holds when disabled");
+        check_output(8'd10, "output holds when disabled");
 
         // Check another enabled operation with the same 64-bit arithmetic.
         @(negedge CLK);
         EN = 1'b1;
-        X_IN = 64'd5;
-        W_IN = 64'd6;
-        Y_IN = 64'd7;
+        X_IN = 8'd5;
+        W_IN = 8'd6;
+        Y_IN = 8'd7;
         @(posedge CLK); #1;
-        check_output(64'd37, "second multiply-accumulate");
+        check_output(8'd37, "second multiply-accumulate");
 
         $display("tb_mac: ALL TESTS PASSED");
         $finish;

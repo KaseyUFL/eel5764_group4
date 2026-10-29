@@ -11,12 +11,10 @@
 //---------------------------------------------------------------------------//
 // add_item class: randomizes x_in, w_in, and y_in
 //---------------------------------------------------------------------------//
-class add_item #(
-  int WIDTH                 
-);
-  rand bit [WIDTH-1:0] x_in;
-  rand bit [WIDTH-1:0] w_in;
-  rand bit [WIDTH-1:0] y_in; 
+class add_item;
+  rand bit [7:0] x_in;
+  rand bit [7:0] w_in;
+  rand bit [7:0] y_in; 
 endclass
 
 //---------------------------------------------------------------------------//
@@ -26,15 +24,13 @@ module tb_mac_adv;
   //-------------------------------------------------------------------------//
   // declare DUT I/O
   //-------------------------------------------------------------------------//
-  localparam integer NUM_BYTES = 8;        // port width (bytes)
-
-  logic        CLK = 1'b0;                 // clock
-  logic        RST_N;                      // reset (active low)     
-  logic        EN;                         // enable  
-  logic        [8*NUM_BYTES-1:0] X_IN;     // input data
-  logic        [8*NUM_BYTES-1:0] W_IN;     // weight
-  logic        [8*NUM_BYTES-1:0] Y_IN;     // partial sum
-  logic signed [8*NUM_BYTES-1:0] Y_OUT;    // output data
+  logic              CLK = 1'b0;  // clock
+  logic              RST_N;       // reset (active low)     
+  logic              EN;          // enable  
+  logic        [7:0] X_IN;        // input data
+  logic        [7:0] W_IN;        // weight
+  logic        [7:0] Y_IN;        // partial sum
+  logic signed [7:0] Y_OUT;       // output data
 
   //-------------------------------------------------------------------------//
   // clock generator
@@ -46,9 +42,7 @@ module tb_mac_adv;
   //-------------------------------------------------------------------------//
   // instantiate DUT
   //-------------------------------------------------------------------------//  
-  mac #(
-    .NUM_BYTES (NUM_BYTES)
-  ) dut (
+  mac dut (
     .CLK     (CLK),
     .RST_N   (RST_N),
     .EN      (EN),
@@ -62,7 +56,7 @@ module tb_mac_adv;
   // check_output task: checks expected value against actual
   //-------------------------------------------------------------------------//   
   task automatic check_output (
-    input logic signed [8*NUM_BYTES-1:0] expected,
+    input logic signed [7:0] expected,
     input string test_name
   );
     if (Y_OUT !== expected) begin
@@ -75,7 +69,7 @@ module tb_mac_adv;
   //-------------------------------------------------------------------------//
   // create instance of add_item class
   //-------------------------------------------------------------------------//  
-  add_item #(.WIDTH(8*NUM_BYTES)) item;
+  add_item item;
 
   //-------------------------------------------------------------------------//
   // test procedure
