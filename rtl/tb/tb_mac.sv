@@ -19,6 +19,7 @@ module tb_mac;
         .X_IN(X_IN),
         .W_IN(W_IN),
         .Y_IN(Y_IN),
+        .X_OUT(),
         .Y_OUT(Y_OUT)
     );
 
