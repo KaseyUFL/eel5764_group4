@@ -7,7 +7,9 @@ module tb_top;
 
     logic CLK = 1'b0;
     logic RST_N;
-    logic EN;
+    logic START;
+    logic IN_VALID;
+    logic IN_READY;
     logic [N-1:0][63:0] ARRAY_IN;
     logic [BANKS-1:0][63:0] ARRAY_OUT;
     logic [BANKS-1:0] WEIGHT_WR_EN;
@@ -25,8 +27,10 @@ module tb_top;
     ) dut (
         .CLK(CLK),
         .RST_N(RST_N),
-        .EN(EN),
+        .START(START),
         .ARRAY_IN(ARRAY_IN),
+        .IN_VALID(IN_VALID),
+        .IN_READY(IN_READY),
         .ARRAY_OUT(ARRAY_OUT),
         .WEIGHT_WR_EN(WEIGHT_WR_EN),
         .WEIGHT_WR_ADDR(WEIGHT_WR_ADDR),
@@ -37,7 +41,8 @@ module tb_top;
 
     initial begin
         RST_N = 1'b0;
-        EN = 1'b0;
+        START = 1'b0;
+        IN_VALID = 1'b0;
         ARRAY_IN = '0;
         WEIGHT_WR_EN = '0;
         WEIGHT_WR_ADDR = '0;
@@ -59,13 +64,18 @@ module tb_top;
         @(negedge CLK);
         WEIGHT_WR_EN = '0;
 
+        // Pulse START so the controller fills the weight registers from SRAM.
+        START = 1'b1;
+        @(negedge CLK);
+        START = 1'b0;
+
         // Drive simple nonzero input words and run for several cycles.
         for (int k = 0; k < N; k++)
             ARRAY_IN[k] = 64'(k + 1);
 
-        EN = 1'b1;
+        IN_VALID = 1'b1;
         repeat (12) @(negedge CLK);
-        EN = 1'b0;
+        IN_VALID = 1'b0;
         @(posedge CLK); #1;
 
         if ((^stall_count) === 1'bx || (^active_count) === 1'bx)
