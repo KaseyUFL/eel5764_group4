@@ -14,10 +14,8 @@ module top #(
 )(   
   input  logic                   CLK,      // clock
   input  logic                   RST_N,    // reset (active low)
-  input  logic                   START,    // load weights from SRAM, then compute
+  input  logic                   EN,       // enable
   input  logic [    N-1:0][63:0] ARRAY_IN, // array inputs (N * 8 bytes)
-  input  logic                   IN_VALID, // ARRAY_IN holds a valid input
-  output logic                   IN_READY, // ARRAY_IN consumed this cycle
   output logic [BANKS-1:0][63:0] ARRAY_OUT, // array outputs (BANKS * 8 bytes)
 
   // SRAM write interface for each bank
@@ -38,11 +36,7 @@ module top #(
   logic [BANKS-1:0][63:0]        weights;
   logic [BANKS-1:0]       weight_valid;
 
-  // weight registers, one per MAC, filled from SRAM by the controller
-  logic [BANKS-1:0][N-1:0][63:0] w_reg;
-  logic                  w_load_en;
-  logic [ADDR_WIDTH-1:0] w_load_row;
-
+  logic all_weights_valid;
   logic stall;
   logic mac_en;
   logic sram_en;
@@ -53,33 +47,37 @@ module top #(
   //-------------------------------------------------------------------------//
   // controller
   //-------------------------------------------------------------------------//
-  controller #(
-    .N(N),
-    .BANKS(BANKS),
-    .ADDR_WIDTH(ADDR_WIDTH)
-  ) controller_u (
-    .CLK(CLK),
-    .RST_N(RST_N),
-    .START(START),
 
-    .SRAM_RD_EN(sram_en),
-    .SRAM_RD_ADDR(sram_addr),
-    .SRAM_RD_VALID(weight_valid),
+  assign sram_en = EN; 
+  assign all_weights_valid = &weight_valid;
 
-    .W_LOAD_EN(w_load_en),
-    .W_LOAD_ROW(w_load_row),
-    .WEIGHTS_READY(),
+  assign stall  = EN && !all_weights_valid;
+  assign mac_en = EN && all_weights_valid;
 
-    .IN_VALID(IN_VALID),
-    .IN_READY(IN_READY),
+  // address advances for each SRAM read
+  always_ff @(posedge CLK or negedge RST_N) begin
+    if (!RST_N) begin
+      sram_addr <= '0;
+    end else if (sram_en) begin
+      if (sram_addr == N-1)
+        sram_addr <= '0;
+      else
+        sram_addr <= sram_addr + 1'b1;
+    end
+  end
 
-    .MAC_EN(mac_en),
-    .STALL(stall),
 
-    .stall_count(stall_count),
-    .active_count(active_count),
-    .load_count()
-  );
+  always_ff @(posedge CLK or negedge RST_N) begin
+    if (!RST_N) begin
+      stall_count  <= '0;
+      active_count <= '0;
+    end else if (EN) begin
+      if (stall)
+        stall_count <= stall_count + 1'b1; //count for stalled cycles
+      else
+        active_count <= active_count + 1'b1; //count for active cycles
+    end
+  end
 
   //-------------------------------------------------------------------------//
   // generate BANKS number of SRAM banks, N * BANKS number of MAC blocks
@@ -107,20 +105,14 @@ module top #(
     );
 
         for (genvar j = 0; j < N; j++) begin : gen_macs
-          // capture this MAC's weight when the controller loads row j
-          always_ff @(posedge CLK or negedge RST_N) begin
-            if (!RST_N)
-              w_reg[i][j] <= '0;
-            else if (w_load_en && w_load_row == j)
-              w_reg[i][j] <= weights[i];
-          end
-
-          mac mac_u (
+          mac #(
+            .NUM_BYTES (8)      // port width (bytes)
+          ) mac_u (   
             .CLK   (CLK),       // clock
             .RST_N (RST_N),     // reset (active low)
             .EN    (mac_en), // enable
             .X_IN  (ARRAY_IN[j]), // input data
-            .W_IN  (w_reg[i][j]), // weight
+            .W_IN  (weights[i]), // weight
             .Y_IN  (partial_sums[i][j]), // partial sum
             .Y_OUT (partial_sums[i][j+1])  // output data
           );
