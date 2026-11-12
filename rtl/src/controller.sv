@@ -6,17 +6,6 @@
 // Engineers   : Evan Espino-DeJesus, Tyla Hart, Kasey Hill and James Woelke //
 // Group       : #4                                                          //
 // Description : Array controller.                                           //
-//                                                                           //
-//   A weight row or input vector is N bytes = WPV = ceil(N/8) 64-bit words. //
-//   Memory layout, word k in bank (k % BANKS) at address (k / BANKS):       //
-//     weight row j,   chunk c : k = j*WPV + c       (byte b = W[j][8c+b])   //
-//     input vector t, chunk c : k = (N+t)*WPV + c   (byte b = X[t][8c+b])   //
-//                                                                           //
-//   Rows and vectors are read in order (weights first). Each cycle reads up //
-//   to BANKS words of the current row/vector, one per bank, so a vector     //
-//   takes ceil(WPV/BANKS) cycles. The array advances (lockstep) only when a //
-//   whole vector has arrived and stalls otherwise. After the last vector    //
-//   it runs 2N-1 more cycles with zero inputs to drain the array.           //
 //---------------------------------------------------------------------------//
 module controller #(
   parameter N          = 8, // array size (N x N MACs)
