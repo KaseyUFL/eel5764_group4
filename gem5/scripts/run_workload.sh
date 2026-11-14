@@ -11,6 +11,7 @@
 #   options   passed straight to systolic_se.py, e.g.
 #             --no-double-buffer  --ideal-spm  --mode sw  --standalone
 #             --arbitration lane  --psum-queue 4
+#             --stall-model lockstep  --bank-ports 1r1w  --bank-hash xor
 #             (all options: $GEM5_BIN gem5_model/configs/systolic_se.py -h)
 #
 # Environment:

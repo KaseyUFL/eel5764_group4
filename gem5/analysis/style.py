@@ -1,4 +1,12 @@
-# EEL5764 Group 4 -- one visual style for every figure.
+#-----------------------------------------------------------------------------#
+# EEL5764 Computer Architecture                                               #
+#-----------------------------------------------------------------------------#
+# Project     : Parameterized SRAM Scratchpad Array                           #
+# Filename    : style.py                                                      #
+# Engineers   : Evan Espino-DeJesus, Tyla Hart, Kasey Hill and James Woelke   #
+# Group       : #4                                                            #
+# Description : One visual style for every figure                             #
+#-----------------------------------------------------------------------------#
 #
 # Colours come from a validated reference palette (categorical slots in fixed
 # order; a one-hue blue ramp for ordered quantities).  Rules used here:

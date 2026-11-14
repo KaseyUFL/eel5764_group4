@@ -16,7 +16,7 @@ number, machine-readable.
 1. Commands (from the repository root)
 --------------------------------------
 
-Everything, from scratch (about an hour with 12 runs in parallel;
+Everything, from scratch (about two hours with 12 runs in parallel;
 cached afterwards):
 
   make all              # = make build data figures
@@ -32,7 +32,8 @@ Step by step:
   make figures          # -> results/figures, results/tables,
                         #    results/data/key_results.json
   make figures PLOTS="fig1 fig17 tables"
-  make check            # results/ vs the last git commit, number by number
+  make check REF=dir    # results/ vs a reference folder, number by number
+  make regress          # default model vs analysis/golden_stats.csv (1 min)
 
 The scripts behind the targets (after  source scripts/env.sh ):
 
@@ -66,20 +67,27 @@ cached runs from the old build are reused.
   compare_results.py two results directories, number by number (make check);
                      simulation data must match exactly, derived tables
                      to within floating-point round-off
+  regress.py         reruns 12 representative points of the default model
+  regress.sh         and diffs them against golden_stats.csv, exactly
+  golden_stats.csv   (make regress).  Run it after every model change.
+  trace_diff.py      first cycle where two --bank-trace files disagree, e.g.
+                     gem5 vs RTL
 
   build/runs/<tag>/  raw gem5 output of each run (stats.txt, config.ini,
                      simout.txt, simerr.txt, run.json, systolic_run.json);
                      not in git.  Tags look like
                      resnet50_conv3x_N16_B11[_nodb][_lane]
                      [_idealspm][_idealdram][_c250MHz][_DDR5_8400_4x8]
-                     [_la4][_lat2][_pq16][_wb4KiB][_dma32][_sw|_standalone]
+                     [_la4][_lat2][_pq16][_wb4KiB][_dma32][_lockstep][_1r1w]
+                     [_wsseparate][_xor][_depth512][_mtauto][_mb64][_split]
+                     [_prepack][_sw|_standalone]
   results/data/<suite>.csv  parsed results (columns:
                      gem5_model/README.txt section 7 and parse_stats.py)
   results/data/key_results.json  headline numbers, machine-readable
   results/figures/   PNG (220 dpi) + PDF (vector, for the paper)
   results/tables/    Markdown (paste into notes) + CSV (for the paper)
 
-Suites (make list); 772 unique runs:
+Suites (make list); 3,573 unique runs (772 of the default model):
 
   Proposal sweeps
   main        64  4 workloads x N{8,16,24,32} x BANKS{4,8,16,32}  Sweeps 1+2
@@ -113,6 +121,50 @@ Suites (make list); 772 unique runs:
   lane        32  ResNet-50 + BERT FFN1, per-lane arbitration
   rtlval      64  reduced *_rtl layers for the RTL comparison (phase 2)
   standalone  64  the main grid without the CPU (consistency)
+
+  Options of the model that are off by default
+  rtlval_idealdram 64  rtlval without DRAM: the RTL testbench preloads the
+                       weights
+  rtlval_lockstep  64  the same with the lockstep stall model
+  lockstep    64  the main grid with the lockstep stall model
+  lockcheck   24  existing options as a lockstep stand-in; lockstep without
+                  DRAM at the staircase's, the rule's and twice N banks
+  bankports  149  bankrule + knee with simple-dual-port banks
+  weightstore 60  1, 2 or 0 bank crossings of a weight tile at low reuse
+  bankhash    28  XOR skew hash at aliasing and rule bank counts
+  mtile       32  512-word banks with M tiling at the rule's banks, and the
+                  whole layer on-chip, at 2 GHz and 250 MHz
+  hostext      8  host metrics of the setup alone; prepacked weights
+  dramwide     6  DDR5-8400 on a 64-byte memory bus
+
+  The RTL's configuration: --bank-ports 1r1w --weight-store fill_bypass
+  (gem5_model/README.txt 6.10)
+  rtlcfg_main     64  the main grid
+  rtlcfg_knee    100  H1/H3: BANKS one at a time across the new knee
+  rtlcfg_gemv     48  H2: M = 1 at 2 GHz and 250 MHz, BANKS down to 1
+  rtlcfg_rulem    82  H3: both bank rules, and 25% fewer, at every reuse M
+  rtlcfg_reuse    80  the reuse sweep
+  rtlcfg_extend   12  N = 40..64
+  rtlcfg_clock    36  250 MHz, so DRAM cannot limit the array
+  rtlcfg_nodb     64  one weight register array, and shadow registers, at
+                      the same points
+  rtlcfg_mtile    28  512-word banks with M tiling, at 2 GHz and 250 MHz
+  rtlcfg_lockstep 107 the global stall: main grid + ResNet-50 knee
+  rtlcfg_rtlval   64  reduced layers without DRAM
+  rtlcfg_rtlval_lockstep 64  the same with the global stall
+  rtlcfg_idealdram 48  the main grid with weights free of DRAM
+  rtlcfg_dram     15  other DRAM types
+
+  Open choices in the RTL, each ready either way
+  rtlcfg_rmw_main 64, rtlcfg_rmw_knee 132, rtlcfg_rmw_lockstep 37
+                      partial sums read back through the read port
+  rtlcfg_nodb_main 64, rtlcfg_nodb_knee 100, rtlcfg_nodb_lockstep 34,
+  rtlcfg_nodb_rtlval 64, rtlcfg_nodb_rtlval_lockstep 64
+                      one weight register array
+  rtlcfg_ntile    32  512-word banks tiled along M and N_out
+  ntile           32  the same with one shared port
+  psumopts      1088  where partial sums live: four options, BANKS one at a
+                      time, both stall models, ResNet-50 + BERT FFN1, no DRAM
 
   The slow runs are the 74 LLaMA GEMV runs (1-2 min each: the host packs
   16 MiB of weights before the layer) and the software BERT FFN1 baseline
@@ -169,6 +221,22 @@ Suites (make list); 772 unique runs:
   fig22_bank_policy            the dip at BANKS = N - 1 (all partial-sum
                                lanes on one bank) and its removal by
                                reads-first queues + a 16-entry write buffer
+  fig23_lockstep_vs_decoupled  steady-state utilization vs load D/B: the
+                               decoupled model, the lockstep model and the
+                               lines min(1, B/D) and 1 / ceil(words/BANKS)
+  fig24_bank_ports             utilization vs BANKS, one shared port per
+                               bank against simple dual port
+  fig25_rtl_config_saturation  the RTL's configuration on the proposal's load
+                               axis and on the load of the busier port
+  fig26_rtl_config_stall       the RTL's configuration: decoupled queues
+                               against a global stall (ResNet-50)
+  fig27_psum_options           where partial sums live sets the bank count
+
+  make paper-figures builds the paper's set from the rtlcfg_* suites into
+  results/paper/rtlcfg/ (fig1, 2, 5, 12, 13, 15, 17, 18, 20, 25, 26, 27).  In
+  that set the load axis is the busier port and the rule is that port's.
+  make paper-figures PAPER_SOURCE=baseline builds the one-shared-port set into
+  results/paper/baseline/ (fig1, 2, 5, 12, 13, 14, 15, 17, 18, 20, 22, 23).
 
 Tables:
 
@@ -203,6 +271,44 @@ Tables:
                                software baseline times
   consistency_host_vs_standalone  compute phase with and without the CPU
   edp                          EDP terms per run
+  saturation_from_load         the N where a B crosses 90%, from the load the
+                               knee suite measures rather than interpolating
+                               between N = 8 and 16
+  rtl_gem5_columns             gem5 cycles for the RTL comparison: without
+                               DRAM (the match for a preloading testbench),
+                               with DRAM, and lockstep
+  lockstep_vs_decoupled        both stall models over the main grid, whole
+                               run and steady state, against the staircase
+                               and the address-map model
+  lockstep_check               the existing options and the new stall model
+                               at the staircase's points
+  bank_rule_1r1w               the rule with one read and one write port
+  weight_store                 1, 2 and 0 bank crossings of a weight tile
+  bank_hash                    XOR skew hash vs modulo
+  m_tiling                     512-word banks: M tile, utilization and layer
+                               time against the whole layer on-chip
+  host_options                 --split-host-stats and --prepacked-weights
+                               against the default
+  dram_wide_bus                DDR5-8400 on a 64-byte memory bus
+  hypotheses_rtl_config.md     auto-generated H1/H2/H3 checks for the RTL's
+                               configuration, with the proposal's D and with
+                               the busier port's
+  rtl_config_fit               model vs gem5 per rtlcfg suite, both forms
+  rtl_config_saturation        the research question, RTL's configuration
+  rtl_config_rule              both bank rules per (layer, N), and 25% fewer
+  rtl_config_rule_vs_reuse     the same at every reuse M
+  rtl_config_gemv              M = 1 at both clocks, and the BANKS floor
+  rtl_config_stall             decoupled vs global stall, with the staircase
+                               and the address-map model
+  rtl_config_single_buffer     one weight register array against shadow ones
+  rtl_config_m_tiling          512-word banks at the busier-port rule's counts
+  psum_options                 where partial sums live, four options side by
+                               side: banks each needs, both stall models
+  psum_options_grid            the same at the main grid's bank counts
+  rtl_config_rmw               partial sums read back: N/2 and ceil(5N/8) banks
+  rtl_config_nodb              one weight register array, at the rule's banks
+  rtl_config_n_tiling          512-word banks: M tiles only, M and N_out tiles
+  n_tiling_1rw                 M and N_out tiles with one shared port
   hypotheses.md                auto-generated H1/H2/H3 checks
 
 
@@ -213,20 +319,34 @@ Tables:
     cp analysis/templates/rtl_cycles.csv.example results/data/rtl_cycles.csv
     # fill in: workload,N,banks,cycles  (workload = the *_rtl names)
     make data SUITES=rtlval                    # gem5 side
-    make figures PLOTS=fig12
+    make data SUITES="rtlcfg_rtlval rtlcfg_rtlval_lockstep"
+    make figures PLOTS=fig12   # uses the global-stall runs; set
+                               # RTL_STALL_MODEL=decoupled, single_buffer or
+                               # baseline for the other gem5 columns
     -> results/figures/fig12_gem5_vs_rtl,
        results/tables/rtl_crossvalidation (error %)
 
-  Vivado (post-route) per array size, for EDP (proposal Sec. V):
-    cp analysis/templates/vivado.csv.example results/data/vivado.csv
-    # fill in: N,power_W,fmax_MHz,dsp,lut,ff,bram
-    make figures PLOTS=fig13
-    EDP = (DRAM rank*.totalEnergy + power x totalCycles / Fmax) x simSeconds
-    (mixing the 2 GHz gem5 clock with the FPGA's Fmax needs a decision:
-    see the proposal review, item A3)
+  Per-cycle comparison, when totals disagree:
+    make run WL=bert_attn_qk_rtl N=8 BANKS=4 \
+        ARGS='--ideal-dram --bank-trace build/gem5_trace.csv'
+    # have the testbench $fwrite the same columns (gem5_model/README.txt 6.8)
+    $PYTHON analysis/trace_diff.py build/gem5_trace.csv rtl_trace.csv
 
-  The .example files (analysis/templates/) contain made-up numbers that
-  only show the format.  Do not copy them without replacing the values.
+  Vivado (post-route) per array size and bank count, for EDP (proposal
+  Sec. V):
+    cp analysis/templates/vivado.csv.example results/data/vivado.csv
+    # fill in: N,banks,fmax_mhz,array_power_w,bram_energy_pj_per_access
+    make figures PLOTS=fig13
+    EDP = (DRAM rank*.totalEnergy + array_power_w x activeCycles / Fmax
+           + (spm_reads_total + spm_writes_total) x pJ per access)
+          x layer time
+    Blank cells count as no number yet.  (Mixing the 2 GHz gem5 clock with
+    the FPGA's Fmax needs a decision: see the proposal review, item A3.)
+    The older columns N,power_W,fmax_MHz,... still work, without the BRAM
+    term.
+
+  rtl_cycles.csv.example contains made-up numbers that only show the format.
+  Do not copy it without replacing the values.
 
 
 5. Notes

@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-# EEL5764 Group 4 -- workload generator (single source of truth).
+#-----------------------------------------------------------------------------#
+# EEL5764 Computer Architecture                                               #
+#-----------------------------------------------------------------------------#
+# Project     : Parameterized SRAM Scratchpad Array                           #
+# Filename    : gen_workloads.py                                              #
+# Engineers   : Evan Espino-DeJesus, Tyla Hart, Kasey Hill and James Woelke   #
+# Group       : #4                                                            #
+# Description : Workload generator (single source of truth)                   #
+#-----------------------------------------------------------------------------#
 #
 # Reads workloads.yaml and, for every workload, writes INT8 operands and the
 # INT32 golden result of  C[M x N_out] = A[M x K] . W[K x N_out]  in the
@@ -144,6 +152,20 @@ def write_gem5(outdir, name, spec, A, W, C, extra):
     return meta
 
 
+def write_prepacked(outdir, W, n_values):
+    """W_packed_N<N>.bin: W as the host program packs it for an N x N array.
+    Tile t = nb * nkb + kb, tile row r holds W[kb*N + r][nb*N .. nb*N + N-1],
+    zero padded.  systolic_se.py --prepacked-weights loads it into DRAM."""
+    K, NOUT = W.shape
+    for N in n_values:
+        nkb, nnb = -(-K // N), -(-NOUT // N)
+        padded = np.zeros((nkb * N, nnb * N), dtype=np.int8)
+        padded[:K, :NOUT] = W
+        # (nnb, nkb, N, N): the file order is nb outer, kb inner.
+        tiles = padded.reshape(nkb, N, nnb, N).transpose(2, 0, 1, 3)
+        tiles.tofile(os.path.join(outdir, f"W_packed_N{N}.bin"))
+
+
 def write_hex(path, arr, width_bytes):
     mask = (1 << (8 * width_bytes)) - 1
     fmt = f"{{:0{2 * width_bytes}x}}\n"
@@ -181,7 +203,24 @@ def main():
     ap.add_argument("--only", nargs="*", help="workload names to generate")
     ap.add_argument("--no-full", action="store_true",
                     help="skip the full-size gem5 binaries")
+    ap.add_argument("--prepack", action="store_true",
+                    help="write only W_packed_N<N>.bin next to the existing "
+                         "W.bin of each workload (N = 8, 16, 24, 32), for "
+                         "systolic_se.py --prepacked-weights")
     args = ap.parse_args()
+
+    if args.prepack:
+        for name in sorted(os.listdir(os.path.join(args.out, "gem5"))):
+            if args.only and name not in args.only:
+                continue
+            d = os.path.join(args.out, "gem5", name)
+            with open(os.path.join(d, "meta.json")) as f:
+                meta = json.load(f)
+            W = np.fromfile(os.path.join(d, "W.bin"), dtype=np.int8)
+            write_prepacked(d, W.reshape(meta["K"], meta["N_out"]),
+                            (8, 16, 24, 32))
+            print(f"packed {name}")
+        return
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)

@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-# EEL5764 Group 4 -- compare two sets of results, number by number.
+#-----------------------------------------------------------------------------#
+# EEL5764 Computer Architecture                                               #
+#-----------------------------------------------------------------------------#
+# Project     : Parameterized SRAM Scratchpad Array                           #
+# Filename    : compare_results.py                                            #
+# Engineers   : Evan Espino-DeJesus, Tyla Hart, Kasey Hill and James Woelke   #
+# Group       : #4                                                            #
+# Description : Compares two result sets, number by number                    #
+#-----------------------------------------------------------------------------#
 #
 #   make check REF=path/to/results   # results/ against a reference copy
 #   $PYTHON analysis/compare_results.py REF [NEW] [--rel 1e-9] [--tol 0]
@@ -11,6 +19,10 @@
 # column is ignored: it only says where the raw gem5 output was.  Figures
 # are not compared; they follow from the data, and their pixels depend on
 # the matplotlib version.
+#
+# A column or a key_results.json value that only NEW has is an addition: it
+# is listed but does not count as a difference, so results stay comparable
+# with a reference made before a statistic was added.
 #
 # Simulation output (data/<suite>.csv) is deterministic and must match
 # exactly.  Derived numbers (tables, key_results.json) may differ in the
@@ -27,6 +39,7 @@ import os
 import sys
 
 ROUNDOFF = [0]   # values that differed only by round-off
+ADDITIONS = set()   # columns and values only the new results have
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 IGNORE = {"run_dir"}
@@ -65,8 +78,7 @@ def compare_rows(ref, new, key, tol, rel):
     out = []
     cols = [c for c in ref[0] if c not in IGNORE] if ref else []
     extra = sorted(set(new[0]) - set(ref[0]) - IGNORE) if new and ref else []
-    if extra:
-        out.append(f"new columns: {', '.join(extra)}")
+    ADDITIONS.update(extra)
     if key:
         r = {row[key]: row for row in ref}
         n = {row[key]: row for row in new}
@@ -115,7 +127,7 @@ def compare_json(ref_path, new_path, tol, rel):
     with open(new_path) as f:
         n = dict(flatten(json.load(f)))
     out = [f"missing {k}" for k in sorted(set(r) - set(n))]
-    out += [f"extra {k}" for k in sorted(set(n) - set(r))]
+    ADDITIONS.update(sorted(set(n) - set(r)))
     for k in sorted(set(r) & set(n)):
         a, b = r[k], n[k]
         if a is None or b is None or isinstance(a, (str, bool)):
@@ -174,6 +186,10 @@ def main():
     if bad:
         print(f"\n{bad} of {len(files)} files differ from {args.ref}")
         sys.exit(1)
+    if ADDITIONS:
+        print(f"\n{len(ADDITIONS)} columns/values are new (not compared): "
+              + ", ".join(sorted(ADDITIONS)[:20])
+              + (", ..." if len(ADDITIONS) > 20 else ""))
     how = "exactly" if args.tol == 0 else f"within {args.tol:g}"
     if ROUNDOFF[0]:
         how = (f"(simulation data {how}; {ROUNDOFF[0]} derived values "

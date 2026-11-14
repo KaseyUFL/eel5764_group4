@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-# EEL5764 Group 4 -- saturation curves, measurements and tables.
+#-----------------------------------------------------------------------------#
+# EEL5764 Computer Architecture                                               #
+#-----------------------------------------------------------------------------#
+# Project     : Parameterized SRAM Scratchpad Array                           #
+# Filename    : plot_curves.py                                                #
+# Engineers   : Evan Espino-DeJesus, Tyla Hart, Kasey Hill and James Woelke   #
+# Group       : #4                                                            #
+# Description : Saturation curves, measurements and tables                    #
+#-----------------------------------------------------------------------------#
 #
 #   make figures                                   # everything
 #   make figures PLOTS="fig1 fig5 tables"          # some of it
@@ -14,8 +22,10 @@
 #
 # Optional inputs, used when present:
 #   results/data/rtl_cycles.csv  workload,N,banks,cycles -> fig12 (gem5 vs RTL)
-#   results/data/vivado.csv      N,power_W,fmax_MHz,dsp,lut,ff,bram
-#                                                     -> fig13 (EDP), table
+#   results/data/vivado.csv      N,banks,fmax_mhz,array_power_w,
+#                                bram_energy_pj_per_access -> fig13 (EDP),
+#                                table (the older N,power_W,fmax_MHz,... also
+#                                works, without the BRAM term)
 #   (templates: analysis/templates/*.example)
 
 import argparse
@@ -23,8 +33,13 @@ import math
 import os
 import sys
 
+import warnings
+
 import numpy as np
 import pandas as pd
+
+# Merges of the wide per-run CSVs; only about speed, and plotting is fast.
+warnings.simplefilter("ignore", pd.errors.PerformanceWarning)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -45,6 +60,9 @@ METADATA = {"png": {"Software": None},
             "pdf": {"Creator": None, "Producer": None, "CreationDate": None},
             "svg": {"Creator": None, "Date": None}}
 ONE_COL, TWO_COL = 3.5, 7.16  # IEEE column widths, inches
+# Set by --paper rtlcfg: figures read the RTL's configuration, where the load
+# is on the busier port and the bank rule is that port's.
+PORT_LOAD = False
 
 
 # ----------------------------------------------------------------- helpers
@@ -65,7 +83,8 @@ def save(fig, name):
         fig.savefig(os.path.join(FIG, f"{name}.{fmt}"),
                     metadata=METADATA[fmt])
     plt.close(fig)
-    print(f"  results/figures/{name}.{{{','.join(FORMATS)}}}")
+    print(f"  results/{os.path.relpath(FIG, RESULTS)}/{name}."
+          f"{{{','.join(FORMATS)}}}")
 
 
 def write_table(df, name, title, notes=""):
@@ -77,7 +96,12 @@ def write_table(df, name, title, notes=""):
             f.write(notes.strip() + "\n\n")
         f.write(df.to_markdown(index=False, floatfmt=".4g"))
         f.write("\n")
-    print(f"  results/tables/{name}.{{md,csv}}")
+    print(f"  results/{os.path.relpath(TAB, RESULTS)}/{name}.{{md,csv}}")
+
+
+def fig_rule_banks(n, M):
+    """The bank rule the figures mark."""
+    return ex.rtl_rule(n, M) if PORT_LOAD else math.ceil(model.demand(n, M) / 8)
 
 
 def shape_of(df, wl):
@@ -145,7 +169,8 @@ def fig1_saturation(main):
         ax.set_ylabel("PE utilization")
     h, l = axs[0, 0].get_legend_handles_labels()
     h.append(plt.Line2D([], [], color=st.INK2, lw=1.0, ls=(0, (3, 2))))
-    l.append("analytical model, eq. (1)-(2) + DRAM ceiling")
+    l.append("analytical model, busier port + DRAM ceiling" if PORT_LOAD
+             else "analytical model, eq. (1)-(2) + DRAM ceiling")
     fig.legend(h, l, loc="lower center", ncol=3, bbox_to_anchor=(0.5, -0.06))
     fig.suptitle("Scratchpad saturation: PE utilization vs. array size",
                  x=0.01, ha="left", fontsize=10, fontweight="bold")
@@ -207,7 +232,8 @@ def fig2_universal(main, knee=None, idealdram=None):
         ax.xaxis.set_minor_formatter(plt.NullFormatter())
         ax.axvline(1, color=st.MUTED, lw=0.8, ls=(0, (1, 2)))
         ax.set_ylim(0, 1.08)
-        ax.set_xlabel("Load  D(N) / B   (demand, eq. 1 / supply, eq. 2)")
+        ax.set_xlabel("Load  max(D_read, D_write) / B" if PORT_LOAD else
+                      "Load  D(N) / B   (demand, eq. 1 / supply, eq. 2)")
         ax.set_title(f"{title} ({len(d)} runs)", loc="left")
     axs[0].set_ylabel("Utilization / stall-free utilization")
     axs[0].legend(loc="lower left", fontsize=6.5)
@@ -539,8 +565,18 @@ def fig12_rtl(main):
         print("  fig12 skipped (no data/rtl_cycles.csv yet)")
         return
     rtl = pd.read_csv(p)
+    # The RTL testbench preloads the weights, so the runs without DRAM are
+    # the matching ones.  Set RTL_STALL_MODEL=decoupled in the environment to
+    # compare with the queued model instead.
+    # The RTL's configuration is simple dual port with a global stall.
+    # The rtlcfg runs assume the settings in experiments.RTL_OPTS; set
+    # RTL_STALL_MODEL=baseline to compare with one shared port.
+    how = os.environ.get("RTL_STALL_MODEL")
+    first = {"decoupled": "rtlcfg_rtlval", "baseline": "rtlval_idealdram",
+             "single_buffer": "rtlcfg_nodb_rtlval_lockstep"}.get(
+                 how, "rtlcfg_rtlval_lockstep")
     runs = []
-    for suite in ("rtlval", "main"):
+    for suite in (first, "rtlval_idealdram", "rtlval", "main"):
         s = load(suite)
         if s is not None:
             runs.append(s)
@@ -580,18 +616,31 @@ def fig12_rtl(main):
 # ------------------------------------------------------------ figure 13
 def fig13_edp(main):
     """Proposal Sec. V: EDP = (DRAM energy + array energy) x layer time.
-    Array energy = Vivado power x active time (cycles / Fmax); until
-    data/vivado.csv exists only the DRAM part is plotted."""
+    Array energy = Vivado power x active time + accesses x energy per BRAM
+    access; until data/vivado.csv has numbers only the DRAM part is plotted.
+    Blank cells in vivado.csv count as no number yet."""
     j = main.copy()
     p = os.path.join(DATA, "vivado.csv")
     have_viv = os.path.exists(p)
+    j["bram_energy_J"] = 0.0
     if have_viv:
-        j = j.merge(pd.read_csv(p), on="N")
-        j["array_energy_J"] = (j.power_W * j.total_cycles /
-                               (j.fmax_MHz * 1e6))
+        viv = pd.read_csv(p)
+        viv = viv.rename(columns={"power_W": "array_power_w",
+                                  "fmax_MHz": "fmax_mhz"})
+        on = ["N", "banks"] if "banks" in viv else ["N"]
+        viv = viv.dropna(subset=["array_power_w", "fmax_mhz"])
+        have_viv = len(viv) > 0
+    if have_viv:
+        j = j.merge(viv, on=on)
+        active_s = j.active_cycles / (j.fmax_mhz * 1e6)
+        j["array_energy_J"] = j.array_power_w * active_s
+        if "bram_energy_pj_per_access" in j:
+            j["bram_energy_J"] = (j.spm_reads_total + j.spm_writes_total) * \
+                j.bram_energy_pj_per_access.fillna(0) * 1e-12
     else:
         j["array_energy_J"] = 0.0
-    j["edp_Js"] = (j.array_energy_J + j.dram_energy_J) * j.layer_time_s
+    j["edp_Js"] = (j.array_energy_J + j.bram_energy_J + j.dram_energy_J) * \
+        j.layer_time_s
     banks = sorted(j.banks.unique())
     col, mk = st.ramp(banks), st.markers(banks)
     fig, axs = plt.subplots(2, 2, figsize=(TWO_COL, 4.8))
@@ -621,7 +670,8 @@ def fig13_edp(main):
     cols = ["workload", "N", "banks", "total_cycles", "layer_time_s",
             "dram_energy_J", "array_energy_J", "edp_Js"]
     if have_viv:
-        cols[4:4] = ["fmax_MHz", "power_W"]
+        cols[4:4] = ["fmax_mhz", "array_power_w"]
+        cols.insert(cols.index("edp_Js"), "bram_energy_J")
     write_table(j[cols].sort_values(["workload", "N", "banks"]), "edp",
                 "Energy-delay product", f"Energy terms: {what}.")
 
@@ -770,14 +820,16 @@ def fig17_knee(knee):
             ax.plot(s.banks, s.pe_util, color=col[n], marker=mk[n], ms=3.5,
                     lw=1.3, label=f"N={n}", zorder=3)
             st.model_line(ax, s.banks, s.pred_util, col[n])
-            rule = math.ceil(model.demand(n, M) / 8)
+            rule = fig_rule_banks(n, M)
             ax.plot([rule, rule], [1.03, 1.09], color=col[n], lw=1.8,
                     solid_capstyle="butt", zorder=3)
-        ax.text(0.4, 1.10, "ceil(D/8) for each N", fontsize=6.5,
+        ax.text(0.4, 1.10, "busier-port rule for each N" if PORT_LOAD else
+                "ceil(D/8) for each N", fontsize=6.5,
                 color=st.MUTED, va="bottom")
-        ax.text(32.6, 0.05, "dips at BANKS = N - 1:\nevery partial-sum "
-                "lane hits the same bank", fontsize=6.5, color=st.MUTED,
-                ha="right", va="bottom")
+        if not PORT_LOAD:
+            ax.text(32.6, 0.05, "dips at BANKS = N - 1:\nevery partial-sum "
+                    "lane hits the same bank", fontsize=6.5, color=st.MUTED,
+                    ha="right", va="bottom")
         ax.set_xlim(0, 33)
         ax.set_xticks(range(0, 33, 4))
         ax.set_ylim(0, 1.17)
@@ -816,7 +868,8 @@ def gemv_frame(main, clock, dram):
     g["cap_frac"] = g.pe_util / g.ideal_util   # fraction of the 1/N cap
     # Scratchpad side at M = 1: N + 5 (eq. 1) plus N more for the DMA
     # writing each tile into the scratchpad.
-    g["spm_ratio"] = 8 * g.banks / (2 * g.N + 5)
+    g["spm_ratio"] = (8 * g.banks / g.model_D_port if PORT_LOAD else
+                      8 * g.banks / (2 * g.N + 5))
     g["model_frac"] = np.minimum(1.0, np.minimum(g.ratio, g.spm_ratio))
     return g
 
@@ -887,10 +940,11 @@ def fig18_gemv_dram(main, clock, dram):
         s = c[c.N == nn].sort_values("banks")
         ax.plot(s.banks, s.cap_frac, color=coln[nn], marker=mkn[nn],
                 label=f"N={nn}", zorder=3)
-        need = (2 * nn + 5) / 8
+        need = (nn + 1) / 8 if PORT_LOAD else (2 * nn + 5) / 8
         ax.plot([need, need], [1.04, 1.09], color=coln[nn], lw=1.8,
                 solid_capstyle="butt")
-    ax.text(0.9, 1.10, "BANKS = (2N + 5) / 8", fontsize=6.5, color=st.MUTED,
+    ax.text(0.9, 1.10, "BANKS = (N + 1) / 8" if PORT_LOAD else
+            "BANKS = (2N + 5) / 8", fontsize=6.5, color=st.MUTED,
             va="bottom")
     ax.set_xscale("log", base=2)
     ax.set_xticks([1, 2, 4, 8, 16, 32])
@@ -958,6 +1012,13 @@ def fig19_sensitivity(sens):
 def rulem_frame(rulem):
     d = rulem.copy()
     d["frac"] = d.pe_util / d.ideal_util
+    if PORT_LOAD:
+        # The suite also holds ceil(D/8) and its 25% fewer: keep this rule's.
+        rule = [ex.rtl_rule(n, m) for n, m in zip(d.N, d.M)]
+        d["kind"] = ["rule" if b == r else
+                     "fewer" if b == max(1, math.floor(0.75 * r)) else "other"
+                     for b, r in zip(d.banks, rule)]
+        return d[d.kind != "other"]
     d["kind"] = ["rule" if b == ex.rule_m_banks(n, m)[0] else "fewer"
                  for n, m, b in zip(d.N, d.M, d.banks)]
     return d
@@ -971,7 +1032,8 @@ def fig20_rule_vs_m(rulem):
     fig, axs = plt.subplots(1, 2, figsize=(TWO_COL, 2.9), sharey=True)
     for ax, kind, title in zip(
             axs, ("rule", "fewer"),
-            ("BANKS = ceil(D(N, M) / 8)", "25% fewer banks than the rule")):
+            ("BANKS = busier-port rule" if PORT_LOAD else
+             "BANKS = ceil(D(N, M) / 8)", "25% fewer banks than the rule")):
         k = d[d.kind == kind]
         for n in ns:
             s = k[k.N == n].sort_values("M")
@@ -1093,6 +1155,1152 @@ def fig22_bank_policy(policy):
                  x=0.01, ha="left", fontsize=10, fontweight="bold")
     fig.tight_layout()
     save(fig, "fig22_bank_policy")
+
+
+# ------------------------------------------------------- figures 23, 24
+def fig23_lockstep(main, knee, lockstep):
+    """The same simulator with and without queues between banks and array:
+    steady-state utilization vs load, against both models."""
+    fig, axs = plt.subplots(1, 2, figsize=(TWO_COL, 3.0), sharey=True)
+    ls = lockstep.copy()
+    ls["load"] = ls.model_D / ls.B_bytes_per_cycle
+    dec = pd.concat([main, knee]).drop_duplicates(["workload", "N", "banks"])
+    dec = dec.copy()
+    dec["load"] = dec.model_D / dec.B_bytes_per_cycle
+    x = np.logspace(np.log10(0.2), np.log10(5.5), 800)
+    for ax, wl in zip(axs, ex.COMPUTE_BOUND):
+        d = dec[dec.workload == wl].sort_values("load")
+        # BANKS dividing N - 1 is the aliasing dip: a different effect.
+        d = d[~aliasing(d)]
+        ax.plot(x, np.minimum(1, 1 / x), color=st.INK2, lw=1.1,
+                ls=(0, (3, 2)), label="model: min(1, B/D)", zorder=2)
+        ax.plot(x, 1 / np.ceil(x), color=st.MUTED, lw=1.1,
+                ls=(0, (1, 1.5)), label="evenly spread lockstep:\n"
+                "1 / ceil(words / BANKS)", zorder=2)
+        ax.scatter(d.load, d.steady_util, s=16,
+                   color=st.WORKLOAD_COLOR[wl],
+                   marker=st.WORKLOAD_MARKER[wl], edgecolor=st.SURFACE,
+                   linewidth=0.4, label="gem5, decoupled", zorder=3)
+        s_ = ls[ls.workload == wl]
+        ax.scatter(s_.load, s_.steady_util, s=26, marker="X",
+                   color=st.INK, edgecolor=st.SURFACE, linewidth=0.4,
+                   label="gem5, lockstep (fixed addresses)", zorder=4)
+        ax.set_xscale("log")
+        ax.set_xticks([0.25, 0.5, 1, 2, 4])
+        ax.set_xticklabels(["1/4", "1/2", "1", "2", "4"])
+        ax.xaxis.set_minor_formatter(plt.NullFormatter())
+        ax.set_ylim(0, 1.08)
+        ax.set_xlabel("Load  D(N) / B")
+        panel_title(ax, wl)
+    axs[0].set_ylabel("Steady-state PE utilization")
+    axs[0].legend(loc="lower left", fontsize=6.5)
+    fig.suptitle("Decoupled vs. lockstep stall, one simulator", x=0.01,
+                 ha="left", fontsize=10, fontweight="bold")
+    fig.tight_layout()
+    save(fig, "fig23_lockstep_vs_decoupled")
+
+
+def fig24_bank_ports(knee, ports):
+    """Utilization vs BANKS, single-port banks against simple dual port."""
+    ns = sorted(knee.N.unique())
+    col, mk = st.ramp(ns), st.markers(ns)
+    fig, axs = plt.subplots(1, 2, figsize=(TWO_COL, 3.0), sharey=True)
+    p_ = ports[ports.psum_queue == 8]
+    for ax, wl in zip(axs, ex.COMPUTE_BOUND):
+        for n in ns:
+            a = knee[(knee.workload == wl) & (knee.N == n)].sort_values("banks")
+            b = p_[(p_.workload == wl) & (p_.N == n)].sort_values("banks")
+            ax.plot(a.banks, a.pe_util, color=col[n], marker=mk[n], ms=3,
+                    lw=0.9, ls=(0, (3, 2)), zorder=2)
+            ax.plot(b.banks, b.pe_util, color=col[n], marker=mk[n], ms=3.5,
+                    lw=1.4, label=f"N={n}", zorder=3)
+        ax.set_xlim(0, 33)
+        ax.set_xticks(range(0, 33, 4))
+        ax.set_ylim(0, 1.08)
+        st.threshold(ax, x=0.3)
+        panel_title(ax, wl)
+        ax.set_xlabel("BANKS")
+    axs[0].set_ylabel("PE utilization")
+    h, l = axs[0].get_legend_handles_labels()
+    h += [plt.Line2D([], [], color=st.INK2, lw=1.4),
+          plt.Line2D([], [], color=st.INK2, lw=0.9, ls=(0, (3, 2)))]
+    l += ["1r1w (simple dual port)", "1rw (one port per bank)"]
+    fig.legend(h, l, loc="lower center", ncol=6, bbox_to_anchor=(0.5, -0.07))
+    fig.suptitle("A separate write port moves the knee", x=0.01, ha="left",
+                 fontsize=10, fontweight="bold")
+    fig.tight_layout()
+    save(fig, "fig24_bank_ports")
+
+
+# ------------------------------------------------------- figures 25, 26
+def rtl_frame(S):
+    """Decoupled runs of the RTL's configuration, compute-bound layers."""
+    d = pd.concat([S["rtlcfg_main"], S["rtlcfg_knee"]]) \
+        .drop_duplicates("tag")
+    return d[d.workload.isin(ex.COMPUTE_BOUND)].copy()
+
+
+def fig25_rtl_config(S):
+    """The hypothesis curve under the RTL's configuration, on the proposal's
+    load axis and on the load of the busier port."""
+    d = rtl_frame(S)
+    d["frac"] = d.pe_util / d.ideal_util
+    d["literal"] = d.model_D / d.B_bytes_per_cycle
+    d["port"] = d.model_D_port / d.B_bytes_per_cycle
+    alias, dram = aliasing(d), d.pred_dram_ceiling < 0.999
+    fig, axs = plt.subplots(1, 2, figsize=(TWO_COL, 3.0), sharey=True)
+    x = np.logspace(np.log10(0.15), np.log10(6), 300)
+    for ax, col, title, lab in (
+            (axs[0], "literal", "Load as the proposal writes it",
+             "Load  D(N) / B   (eq. 1 / eq. 2)"),
+            (axs[1], "port", "Load on the busier port",
+             "Load  max(D_read, D_write) / B")):
+        ax.plot(x, np.minimum(1, 1 / x), color=st.INK2, lw=1.2,
+                ls=(0, (3, 2)), label="model: min(1, 1 / load)", zorder=2)
+        for wl in ex.COMPUTE_BOUND:
+            s_ = d[(d.workload == wl) & ~alias & ~dram]
+            ax.scatter(s_[col], s_.frac, s=18, color=st.WORKLOAD_COLOR[wl],
+                       marker=st.WORKLOAD_MARKER[wl], edgecolor=st.SURFACE,
+                       linewidth=0.5, label=st.WORKLOAD_SHORT[wl], zorder=3)
+        s_ = d[dram & ~alias]
+        ax.scatter(s_[col], s_.frac, s=20, marker="o", facecolor="none",
+                   edgecolor=st.INK2, linewidth=0.8,
+                   label="DRAM-limited", zorder=4)
+        s_ = d[alias]
+        ax.scatter(s_[col], s_.frac, s=20, marker="x", color=st.INK2,
+                   linewidth=0.8, label="aliasing: BANKS divides N - 1",
+                   zorder=4)
+        ax.set_xscale("log")
+        ax.set_xticks([0.25, 0.5, 1, 2, 4])
+        ax.set_xticklabels(["1/4", "1/2", "1", "2", "4"])
+        ax.xaxis.set_minor_formatter(plt.NullFormatter())
+        ax.axvline(1, color=st.MUTED, lw=0.8, ls=(0, (1, 2)))
+        ax.set_ylim(0, 1.08)
+        ax.set_xlabel(lab)
+        ax.set_title(title, loc="left")
+    axs[0].set_ylabel("Utilization / stall-free utilization")
+    axs[0].legend(loc="lower left", fontsize=6.5)
+    fig.suptitle("Simple-dual-port banks: the knee follows the busier port",
+                 x=0.01, ha="left", fontsize=10, fontweight="bold")
+    fig.tight_layout()
+    save(fig, "fig25_rtl_config_saturation")
+
+
+def fig26_rtl_stall(S):
+    """ResNet-50 in the RTL's configuration: queues against a global stall."""
+    dec = rtl_frame(S)
+    dec = dec[dec.workload == "resnet50_conv3x"]
+    lock = S["rtlcfg_lockstep"]
+    lock = lock[lock.workload == "resnet50_conv3x"]
+    ns = ex.N_VALUES
+    col, mk = st.ramp(ns), st.markers(ns)
+    fig, ax = plt.subplots(figsize=(TWO_COL, 3.0))
+    for n in ns:
+        a = dec[(dec.N == n) & (dec.banks <= 32)].sort_values("banks")
+        b = lock[(lock.N == n) & (lock.banks <= 32)].sort_values("banks")
+        ax.plot(a.banks, a.steady_util, color=col[n], lw=0.9,
+                ls=(0, (3, 2)), marker=mk[n], ms=2.5, zorder=2)
+        ax.plot(b.banks, b.steady_util, color=col[n], lw=1.4, marker=mk[n],
+                ms=3.5, label=f"N={n}", zorder=3)
+    ax.set_xlim(0, 33)
+    ax.set_xticks(range(0, 33, 4))
+    ax.set_ylim(0, 1.08)
+    st.threshold(ax, x=24)
+    ax.set_xlabel("BANKS")
+    ax.set_ylabel("Steady-state PE utilization")
+    h, l = ax.get_legend_handles_labels()
+    h += [plt.Line2D([], [], color=st.INK2, lw=1.4),
+          plt.Line2D([], [], color=st.INK2, lw=0.9, ls=(0, (3, 2)))]
+    l += ["global stall (lockstep)", "decoupled queues"]
+    ax.legend(h, l, loc="lower right", ncol=2, fontsize=6.5)
+    ax.set_title("Same rule, but a global stall steps and dips between "
+                 "its counts (ResNet-50, 1r1w)", loc="left")
+    fig.tight_layout()
+    save(fig, "fig26_rtl_config_stall")
+
+
+# ------------------------------------------------------------- figure 27
+PSUM_LABEL = {"A": "A: in the banks, one port per bank",
+              "B": "B: in the banks, SDP, written once",
+              "B+rmw": "B: SDP, read back and rewritten",
+              "C": "C: outside the counted banks"}
+
+
+def psum_option(df):
+    """Which of experiments.PSUM_OPTIONS each run of the psumopts suite is."""
+    return np.select(
+        [df.psum_store == "external", df.psum_rmw == 1,
+         df.bank_ports == "1r1w"], ["C", "B+rmw", "B"], default="A")
+
+
+def fig27_psum_options(po):
+    """What the place partial sums live does to the bank count."""
+    d = po[po.workload == "resnet50_conv3x"].copy()
+    d["option"] = psum_option(d)
+    ns = ex.N_VALUES
+    col, mk = st.ramp(ns), st.markers(ns)
+    fig, axs = plt.subplots(2, 2, figsize=(TWO_COL, 4.6), sharex=True,
+                            sharey=True)
+    for ax, opt in zip(axs.flat, ex.PSUM_OPTIONS):
+        for n in ns:
+            s = d[(d.option == opt) & (d.N == n) & (d.banks <= 28)]
+            a = s[s.stall_model == "decoupled"].sort_values("banks")
+            b = s[s.stall_model == "lockstep"].sort_values("banks")
+            ax.plot(a.banks, a.steady_util, color=col[n], marker=mk[n], ms=3,
+                    lw=1.4, label=f"N={n}", zorder=3)
+            ax.plot(b.banks, b.steady_util, color=col[n], lw=0.9,
+                    ls=(0, (3, 2)), zorder=2)
+        ax.set_ylim(0, 1.08)
+        ax.set_xlim(0, 29)
+        ax.set_xticks(range(0, 29, 4))
+        st.threshold(ax, x=20, text=None)
+        ax.set_title(PSUM_LABEL[opt], loc="left")
+    for ax in axs[1]:
+        ax.set_xlabel("BANKS")
+    for ax in axs[:, 0]:
+        ax.set_ylabel("Steady-state PE utilization")
+    h, l = axs[0, 0].get_legend_handles_labels()
+    h += [plt.Line2D([], [], color=st.INK2, lw=1.4),
+          plt.Line2D([], [], color=st.INK2, lw=0.9, ls=(0, (3, 2)))]
+    l += ["decoupled queues", "global stall, fixed addresses"]
+    fig.legend(h, l, loc="lower center", ncol=6, bbox_to_anchor=(0.5, -0.04))
+    fig.suptitle("Where partial sums live sets the bank count (ResNet-50, no "
+                 "DRAM)", x=0.01, ha="left", fontsize=10, fontweight="bold")
+    fig.tight_layout()
+    save(fig, "fig27_psum_options")
+
+
+# ------------------------------------------------- tables of the extensions
+def saturation_from_load(key, knee, main):
+    """Table VI's 90% crossing without interpolating between N = 8 and 16.
+    The model only accepts N that are multiples of 8, but the knee suite
+    measures the same crossing at a fixed N by moving BANKS, as a load D/B.
+    Utilization depends on N and BANKS only through D/B, so the measured
+    load at 90% converts into the N at which a given B crosses 90%."""
+    rows = []
+    for wl in ex.COMPUTE_BOUND:
+        M = ex.M_OF[wl]
+        cross = []
+        for n in ex.N_VALUES:
+            s = knee[(knee.workload == wl) & (knee.N == n)] \
+                .sort_values("banks")
+            s = s[~aliasing(s) & (s.pred_dram_ceiling > 0.999)]
+            hit = s[s.pe_util >= 0.9]
+            if len(hit) and hit.banks.min() > s.banks.min():
+                b1 = int(hit.banks.min())
+                r1 = s[s.banks == b1].iloc[0]
+                before = s[s.banks < b1].iloc[-1]
+                frac = (0.9 - before.pe_util) / (r1.pe_util - before.pe_util)
+                b_eq = before.banks + frac * (b1 - before.banks)
+                cross.append(model.demand(n, M) / (8 * b_eq))
+        load = float(np.mean(cross))
+        for bk in ex.BANK_VALUES:
+            B = 8 * bk
+            ns = np.arange(1.0, 128.0, 0.01)
+            D = (5 * ns * M + ns ** 2) / np.maximum(M, ns)
+            n_load = float(ns[np.argmax(D / B > load)])
+            d = main[(main.workload == wl) & (main.banks == bk)] \
+                .sort_values("N")
+            rows.append({
+                "workload": wl, "BANKS": bk, "B (bytes/cycle)": B,
+                "N at 90%, interpolated (Table VI)":
+                    crossing(d.N, d.pe_util),
+                "measured D/B at 90%": round(load, 3),
+                "N at 90%, from the measured D/B": round(n_load, 1),
+                "N at 90% (eq. 1-2)": round(model_n90(M, bk)[0], 1),
+            })
+    write_table(pd.DataFrame(rows), "saturation_from_load",
+                "Where the scratchpad saturates, from the measured load",
+                "Runs at N between multiples of 8 are not possible (see "
+                "gem5_model/README.txt 6.9).  Interpolating linearly between "
+                "N = 8 and N = 16 places the crossing too low, because "
+                "utilization stays near 1 up to D = B and only then falls.  "
+                "The knee suite measures the crossing directly at fixed N "
+                "by moving BANKS one at a time (aliasing and DRAM-bound "
+                "points excluded); this table converts that load to N "
+                "through eq. (1).  At M >> N it is derived, not a run at "
+                "that N.")
+    key["saturation_from_load"] = {
+        f"{r['workload']}_B{r['BANKS']}":
+        r["N at 90%, from the measured D/B"] for r in rows}
+
+
+def m_tile_rows(mt):
+    """Each tiled run against the whole layer on-chip at the same clock."""
+    rows = []
+    tiled = mt[mt.spm_depth > 0]
+    whole = mt[mt.spm_depth == 0]
+    for r in tiled.itertuples():
+        b = whole[(whole.workload == r.workload) & (whole.N == r.N) &
+                  (whole.banks == r.banks) &
+                  (whole.clock_hz == r.clock_hz)].iloc[0]
+        rows.append({
+            "workload": r.workload, "N": r.N, "BANKS": r.banks,
+            "array MHz": r.clock_hz / 1e6,
+            "whole layer KiB": round(b.spm_required_bytes / 1024, 1),
+            "capacity KiB (512 words)":
+                round(r.spm_capacity_bytes / 1024, 1),
+            "M tile rows": r.m_tile or r.M, "M tiles": int(r.m_tiles),
+            "N_out slice": r.n_tile or r.N_out,
+            "slices": int(r.n_slices) if pd.notna(r.n_slices) else 1,
+            "util, whole layer": b.pe_util,
+            "util, tiled": r.pe_util,
+            "model, tiled": r.pred_util,
+            "layer time ms, whole layer": b.layer_time_s * 1e3,
+            "layer time ms, tiled": r.layer_time_s * 1e3,
+            "time ratio": r.layer_time_s / b.layer_time_s,
+            "DRAM MiB, whole layer": b.dram_bytes / 2 ** 20,
+            "DRAM MiB, tiled": r.dram_bytes / 2 ** 20,
+        })
+    return rows
+
+
+def extension_tables(S, key):
+    """Tables of the model options that are off by default."""
+    main, knee = S["main"], S["knee"]
+    rtlval, rtl_ideal = S["rtlval"], S["rtlval_idealdram"]
+    rtl_lock = S.get("rtlval_lockstep")
+    if knee is not None:
+        saturation_from_load(key, knee, main)
+
+    # ---- gem5 side of the gem5-vs-RTL table
+    if rtlval is not None and rtl_ideal is not None:
+        j = rtlval.merge(rtl_ideal, on=["workload", "N", "banks"],
+                         suffixes=("_dram", "_ideal"))
+        j["dram_stall_cycles"] = j.total_cycles_dram - j.total_cycles_ideal
+        cols = ["workload", "N", "banks", "total_cycles_ideal",
+                "pe_util_ideal", "total_cycles_dram", "dram_stall_cycles"]
+        if rtl_lock is not None:
+            j = j.merge(rtl_lock[["workload", "N", "banks", "total_cycles",
+                                  "pe_util"]]
+                        .rename(columns={"total_cycles": "lockstep_cycles",
+                                         "pe_util": "lockstep_util"}),
+                        on=["workload", "N", "banks"])
+            cols += ["lockstep_cycles", "lockstep_util"]
+        for suite, name in (("rtlcfg_rtlval", "sdp"),
+                            ("rtlcfg_rtlval_lockstep", "sdp_lockstep"),
+                            ("rtlcfg_nodb_rtlval_lockstep",
+                             "sdp_one_array_lockstep")):
+            if S.get(suite) is not None:
+                j = j.merge(S[suite][["workload", "N", "banks",
+                                      "total_cycles", "pe_util"]]
+                            .rename(columns={
+                                "total_cycles": f"{name}_cycles",
+                                "pe_util": f"{name}_util"}),
+                            on=["workload", "N", "banks"])
+                cols += [f"{name}_cycles", f"{name}_util"]
+        write_table(j[cols].sort_values(["workload", "N", "banks"]),
+                    "rtl_gem5_columns",
+                    "gem5 cycle counts for the gem5-vs-RTL comparison",
+                    "The testbench preloads the weights, so "
+                    "total_cycles_ideal (no DRAM) is the column to compare "
+                    "with RTL cycles; total_cycles_dram includes weight "
+                    "refill from DDR4.  lockstep_cycles is the same layer "
+                    "with the lockstep stall model, also without DRAM: the "
+                    "comparison point if the RTL implements a global stall.  "
+                    "sdp_* are the RTL's configuration (simple-dual-port "
+                    "banks), and sdp_lockstep_cycles is the column closest "
+                    "to rtl/src today, which has no queues; "
+                    "sdp_one_array_lockstep_cycles is that with one weight "
+                    "register array, if the RTL keeps it.")
+        key["rtlval_dram_stall_cycles"] = {
+            wl: {"min": float(v.min()), "max": float(v.max())} for wl, v in
+            j.groupby("workload").dram_stall_cycles}
+
+    # ---- lockstep
+    lock, check = S["lockstep"], S["lockcheck"]
+    if lock is not None:
+        j = lock.merge(main, on=["workload", "N", "banks"],
+                       suffixes=("_lock", "_dec"))
+        t = j[["workload", "N", "banks", "pe_util_dec", "steady_util_dec",
+               "pe_util_lock", "steady_util_lock",
+               "pred_lockstep_staircase_lock",
+               "pred_lockstep_fixed_addr_lock"]].rename(columns={
+                   "pe_util_dec": "decoupled",
+                   "steady_util_dec": "decoupled steady",
+                   "pe_util_lock": "lockstep",
+                   "steady_util_lock": "lockstep steady",
+                   "pred_lockstep_staircase_lock": "staircase",
+                   "pred_lockstep_fixed_addr_lock": "address-map model"})
+        write_table(t.sort_values(["workload", "N", "banks"]),
+                    "lockstep_vs_decoupled",
+                    "Decoupled vs. lockstep stall model (main grid)",
+                    "steady = steadyStateUtilization, the window from the "
+                    "first row's last partial sum to the last row entering "
+                    "the array.  staircase = 1 / ceil(words / BANKS), the "
+                    "words spread evenly.  address-map model = the "
+                    "staircase's busiest bank worked out from gem5's fixed "
+                    "per-stream addresses (model.lockstep_fixed_address).")
+        key["lockstep_steady_resnet50"] = {
+            f"N{r.N}_B{r.banks}": float(r.steady_util_lock)
+            for r in j[j.workload == "resnet50_conv3x"].itertuples()}
+    if check is not None:
+        c = check.copy()
+        opt = c[c.arbitration == "lane"]
+        rows = []
+        for r in opt.itertuples():
+            rows.append({
+                "kind": "--arbitration lane --lookahead 1 --psum-queue 1",
+                "N": r.N, "BANKS": r.banks, "steady util": r.steady_util,
+                "staircase": model.lockstep_staircase(r.N, r.banks),
+                "address-map model": ""})
+        for r in c[c.stall_model == "lockstep"].itertuples():
+            rows.append({
+                "kind": "--stall-model lockstep --ideal-dram",
+                "N": r.N, "BANKS": r.banks, "steady util": r.steady_util,
+                "staircase": r.pred_lockstep_staircase,
+                "address-map model": r.pred_lockstep_fixed_addr})
+        write_table(pd.DataFrame(rows), "lockstep_check",
+                    "Lockstep steady state against the staircase (ResNet-50)",
+                    "The existing options cannot give lockstep: with a "
+                    "lookahead of 1 the read round trip caps every point at "
+                    "1/3.  The new stall model matches the staircase where "
+                    "gem5's fixed addresses happen to spread the words "
+                    "evenly and falls below it elsewhere; the address map "
+                    "accounts for the difference.")
+
+    # ---- simple dual port
+    ports, bankrule = S["bankports"], S["bankrule"]
+    if ports is not None and knee is not None:
+        rows = []
+        for wl in ex.COMPUTE_BOUND:
+            M = ex.M_OF[wl]
+            for n in ex.N_VALUES:
+                a = knee[(knee.workload == wl) & (knee.N == n)]
+                b = ports[(ports.workload == wl) & (ports.N == n) &
+                          (ports.psum_queue == 8)]
+
+                def at(d, bk):
+                    r = d[d.banks == bk]
+                    return float(r.pe_util.iloc[0]) if len(r) else \
+                        float("nan")
+
+                def fewest(d, thr):
+                    v = d[d.pe_util >= thr * d.ideal_util]
+                    return int(v.banks.min()) if len(v) else "none"
+                rule1 = math.ceil(model.demand(n, M) / 8)
+                half = n // 2
+                rows.append({
+                    "workload": wl, "N": n,
+                    "1rw rule ceil(D/8)": rule1,
+                    "util 1rw at rule": at(a, rule1),
+                    "1r1w: ceil(4N/8)": half,
+                    "util 1r1w at N/2": at(b, half),
+                    "util 1rw at N/2": at(a, half),
+                    "1r1w rule with DMA fill":
+                        model.banks_needed_1r1w(n, M),
+                    "fewest 1rw for 99%": fewest(a, 0.99),
+                    "fewest 1r1w for 99%": fewest(b, 0.99),
+                    "fewest 1rw for 90%": fewest(a, 0.9),
+                    "fewest 1r1w for 90%": fewest(b, 0.9),
+                })
+        write_table(pd.DataFrame(rows), "bank_rule_1r1w",
+                    "The bank rule with simple-dual-port banks",
+                    "With one read and one write port per bank the write "
+                    "stream sets the bank count: BANKS = max(ceil(D_read/8), "
+                    "ceil(D_write/8)), N/2 for M >> N, against ceil(D/8) "
+                    "with one shared port.  'with DMA fill' also counts the "
+                    "weight DMA on the write side, which rounds up one bank "
+                    "at M >> N and is what model.banks_needed_1r1w returns.")
+        key["bank_rule_1r1w"] = {
+            f"{r['workload']}_N{r['N']}": {
+                "util_at_half_N": r["util 1r1w at N/2"],
+                "fewest_for_99pct": r["fewest 1r1w for 99%"]}
+            for r in rows}
+
+    # ---- weight store
+    ws = S["weightstore"]
+    if ws is not None:
+        t = ws[["workload", "M", "N", "banks", "clock_hz", "weight_store",
+                "pe_util", "ideal_util", "pred_util", "spm_bw_total",
+                "dram_bus_util"]].copy()
+        t["util / stall-free"] = t.pe_util / t.ideal_util
+        t["array MHz"] = t.clock_hz / 1e6
+        t = t.drop(columns=["clock_hz"])
+        write_table(t.sort_values(["M", "array MHz", "N", "banks",
+                                   "weight_store"]), "weight_store",
+                    "Bank crossings of a weight tile",
+                    "spm: DMA write + array read, 2 crossings, D_fill "
+                    "(2N + 5 at M = 1).  fill_bypass: array read only, 1 "
+                    "crossing, eq. (1) as the proposal writes it (N + 5).  "
+                    "separate: a staging buffer outside the banks, 0 "
+                    "crossings (5 bytes/cycle at M = 1).  250 MHz keeps "
+                    "DRAM out of the picture.")
+        v = ws[(ws.workload == "reuse_M1") & (ws.N == 8) &
+               (ws.clock_hz == 250e6)]
+        key["weight_store_M1_N8_util_over_stall_free"] = {
+            f"{r.weight_store}_B{r.banks}": float(r.pe_util / r.ideal_util)
+            for r in v.itertuples()}
+
+    # ---- XOR bank hash
+    bh = S["bankhash"]
+    if bh is not None:
+        t = bh.pivot_table(index=["workload", "N", "banks"],
+                           columns="bank_hash", values="pe_util") \
+            .reset_index()
+        t["stall-free"] = [float(bh[(bh.workload == r.workload) &
+                                    (bh.N == r.N) & (bh.banks == r.banks)]
+                                 .ideal_util.iloc[0])
+                           for r in t.itertuples()]
+        t["case"] = np.where(t.banks == t.N - 1, "BANKS = N-1 (aliasing)",
+                             "rule ceil(D/8)")
+        write_table(t.sort_values(["case", "workload", "N"]), "bank_hash",
+                    "XOR skew hash vs. modulo bank map",
+                    "xor: with row r = w div BANKS, bank = (w + (r ^ (r >> "
+                    "s))) mod BANKS, s = ceil(log2 BANKS).  One-to-one for "
+                    "any BANKS, oldest-first queues, 8-entry write buffer.")
+        al = t[t.case == "BANKS = N-1 (aliasing)"]
+        key["bank_hash_aliasing"] = {
+            f"{r.workload}_N{r.N}": {"modulo": float(r.modulo),
+                                     "xor": float(r.xor)}
+            for r in al.itertuples()}
+
+    # ---- bank depth and M tiling
+    mt = S["mtile"]
+    if mt is not None:
+        rows = m_tile_rows(mt)
+        write_table(pd.DataFrame(rows), "m_tiling",
+                    "512-word banks at the rule's bank counts",
+                    "--spm-depth 512 --m-tile auto: the largest M tile that "
+                    "fits, with at most a quarter of the capacity for weight "
+                    "prefetch.  Every weight tile is reloaded from DRAM for "
+                    "each M tile, and the reuse M of eq. (1) becomes the "
+                    "tile height, so the rule's bank counts, sized for the "
+                    "whole layer's M, no longer match the demand.")
+        key["m_tiling"] = {
+            f"{r['workload']}_N{r['N']}_{r['array MHz']:.0f}MHz": {
+                "m_tile": int(r["M tile rows"]),
+                "util_whole": float(r["util, whole layer"]),
+                "util_tiled": float(r["util, tiled"]),
+                "time_ratio": float(r["time ratio"])}
+            for r in rows}
+
+    # ---- host-side options
+    hx = S["hostext"]
+    if hx is not None:
+        rows = []
+        for r in hx.itertuples():
+            b = main[(main.workload == r.workload) & (main.N == r.N) &
+                     (main.banks == r.banks)].iloc[0]
+            rows.append({
+                "workload": r.workload, "N": r.N, "BANKS": r.banks,
+                "option": "--prepacked-weights" if "prepack" in r.tag
+                else "--split-host-stats",
+                "total cycles, default": b.total_cycles,
+                "total cycles": r.total_cycles,
+                "layer time us, default": b.layer_time_s * 1e6,
+                "layer time us": r.layer_time_s * 1e6,
+                "host CPI, default (polling)": b.host_cpi,
+                "host CPI (setup)" if "split" in r.tag else "host CPI":
+                    r.host_cpi,
+            })
+        write_table(pd.DataFrame(rows), "host_options",
+                    "Host-side options against the default",
+                    "--split-host-stats: host CPI of the register setup "
+                    "instead of the polling loop.  --prepacked-weights: "
+                    "the weights arrive in the DRAM image, so the simulation "
+                    "skips packing them (the setup stats dump is not the "
+                    "measured region).")
+
+    # ---- DDR5-8400 on a wider memory bus
+    dw, dram = S["dramwide"], S["dram"]
+    if dw is not None and dram is not None:
+        rows = []
+        for r in dw.itertuples():
+            ref = main if r.mem_type == "DDR4_2400_8x8" else dram
+            b = ref[(ref.workload == r.workload) & (ref.N == r.N) &
+                    (ref.banks == r.banks)]
+            b = b[b.mem_type == r.mem_type].iloc[0]
+            rows.append({
+                "workload": r.workload, "N": r.N, "DRAM": r.mem_type,
+                "util, 16-byte bus": b.pe_util, "util, 64-byte bus": r.pe_util,
+                "DRAM read GB/s, 16-byte bus": b.dram_read_bw_GBs,
+                "DRAM read GB/s, 64-byte bus": r.dram_read_bw_GBs,
+                "DRAM peak GB/s": r.dram_peak_GBs,
+                "sustained / peak, 64-byte bus":
+                    r.dram_read_bw_GBs / r.dram_peak_GBs,
+            })
+        write_table(pd.DataFrame(rows), "dram_wide_bus",
+                    "DDR5-8400 on a wider memory bus",
+                    "gem5's 16-byte SystemXBar passes one 64-byte packet "
+                    "every 5 of its 2 GHz cycles (25.6 GB/s), below what "
+                    "DDR5-8400 can supply.  --membus-width 64 removes that "
+                    "limit.  DDR4-2400 is included to show the wider bus "
+                    "changes little where the DRAM was already the limit.")
+
+
+def option_tables(S, key, L):
+    """The RTL team's open choices: where partial sums live (R4), reading
+    them back (R1), one weight register array (R2), and tiling (R3)."""
+    # ---- where partial sums live
+    po = S.get("psumopts")
+    if po is not None:
+        d = po.copy()
+        d["option"] = psum_option(d)
+        d["frac"] = d.pe_util / d.ideal_util
+        rows, grid = [], []
+        for wl in ex.COMPUTE_BOUND:
+            M, K = ex.M_OF[wl], {"resnet50_conv3x": 1152, "bert_ffn1": 768}[wl]
+            for n in ex.N_VALUES:
+                T = max(M, n)
+                for opt, o in ex.PSUM_OPTIONS.items():
+                    s_ = d[(d.workload == wl) & (d.N == n) &
+                           (d.option == opt)]
+                    dec = s_[s_.stall_model == "decoupled"] \
+                        .sort_values("banks")
+                    lock = s_[s_.stall_model == "lockstep"] \
+                        .sort_values("banks")
+                    ports = o.get("bank_ports", "1rw")
+                    rmw = o.get("psum_rmw", False)
+                    store = o.get("psum_store", "spm")
+                    if ports == "1r1w":
+                        avg = max(model.port_demand(
+                            n, M, "fill_bypass", True, True,
+                            model.rmw_fraction(n, K) if rmw else 0.0, store))
+                    else:
+                        avg = (5 * n * M + n * n) / T
+
+                    def fewest(f, thr):
+                        v = f[f.frac >= thr]
+                        return int(v.banks.min()) if len(v) else "none swept"
+                    one_tile = max(
+                        model.ceil_div(n, 8) + (n // 2 if rmw else 0),
+                        0 if store == "external" else n // 2)
+                    if ports == "1rw":
+                        one_tile = model.lockstep_words(n)
+                    if store == "external":
+                        one_tile = 2 * model.ceil_div(n, 8)
+                    peak = model.lockstep_peak_words(n, ports, rmw, store)
+
+                    def at(f, b):
+                        v = f[f.banks == b]
+                        return float(v.frac.iloc[0]) if len(v) else float("nan")
+                    rows.append({
+                        "workload": wl, "N": n, "option": opt,
+                        "average demand, banks": math.ceil(avg / 8),
+                        "gem5 decoupled, fewest for 99%": fewest(dec, 0.99),
+                        "bank simulator (one tile)": one_tile,
+                        "peak of back-to-back tiles": peak,
+                        "gem5 global stall, fewest for 99%":
+                            fewest(lock, 0.99),
+                        "global stall, util at the simulator's count":
+                            at(lock, one_tile),
+                        "global stall, util at peak count": at(lock, peak),
+                    })
+                    for b in ex.BANK_VALUES:
+                        grid.append({"workload": wl, "N": n, "BANKS": b,
+                                     "option": opt,
+                                     "decoupled": at(dec, b),
+                                     "global stall": at(lock, b)})
+        t = pd.DataFrame(rows)
+        write_table(t, "psum_options",
+                    "Where partial sums live, side by side (no DRAM)",
+                    "A: accumulator banks in the scratchpad, one port per "
+                    "bank, written once.  B: the same with SDP banks.  B+rmw: "
+                    "SDP, read back through the read port and rewritten.  C: "
+                    "outside the counted banks.  'Bank simulator' is the "
+                    "evenly spread count for one tile as bank-sim reports it, "
+                    "from a formula here (the page was not run).  'Peak' adds "
+                    "the next tile's weights loading alongside.  gem5's "
+                    "global stall uses fixed per-stream addresses.  Values "
+                    "are utilization / stall-free.")
+        write_table(pd.DataFrame(grid), "psum_options_grid",
+                    "The options at the main grid's bank counts (no DRAM)",
+                    "Utilization / stall-free.")
+        L += ["", "## Where partial sums live (no DRAM)", ""]
+        for r in rows:
+            if r["workload"] == "resnet50_conv3x":
+                L.append(f"* N={r['N']} option {r['option']}: gem5 decoupled "
+                         f"needs {r['gem5 decoupled, fewest for 99%']} banks "
+                         f"for 99%; global stall with fixed addresses, "
+                         f"{r['gem5 global stall, fewest for 99%']}.")
+        key["psum_options"] = {
+            f"{r['workload']}_N{r['N']}_{r['option']}": {
+                "decoupled_99": r["gem5 decoupled, fewest for 99%"],
+                "lockstep_99": r["gem5 global stall, fewest for 99%"]}
+            for r in rows}
+
+    # ---- partial sums read back
+    rm_, rk_ = S.get("rtlcfg_rmw_main"), S.get("rtlcfg_rmw_knee")
+    if rm_ is not None and rk_ is not None:
+        lock = S.get("rtlcfg_rmw_lockstep")
+        base = pd.concat([S["rtlcfg_knee"], S["rtlcfg_main"]]) \
+            .drop_duplicates("tag")
+        rows = []
+        for wl in ex.COMPUTE_BOUND:
+            for n in ex.N_VALUES:
+                r5 = math.ceil(5 * n / 8)
+                k = rk_[(rk_.workload == wl) & (rk_.N == n)]
+                b_ = base[(base.workload == wl) & (base.N == n)]
+                lk = lock[(lock.workload == wl) & (lock.N == n)]
+
+                def at(f, b):
+                    v = f[f.banks == b]
+                    return float(v.pe_util.iloc[0]) if len(v) else float("nan")
+                v99 = k[k.pe_util >= 0.99 * k.ideal_util]
+                rows.append({
+                    "workload": wl, "N": n,
+                    "N/2 banks, written once": at(b_, n // 2),
+                    "N/2 banks, read back": at(k, n // 2),
+                    "ceil(5N/8) banks": r5,
+                    "ceil(5N/8), read back": at(k, r5),
+                    "fewest for 99%, read back":
+                        int(v99.banks.min()) if len(v99) else "none (DRAM)",
+                    "global stall, ceil(5N/8)": at(lk, r5),
+                    "global stall, ceil(3N/4)":
+                        at(lk, math.ceil(3 * n / 4)),
+                })
+        t = pd.DataFrame(rows)
+        write_table(t, "rtl_config_rmw",
+                    "Partial sums read back through the read port",
+                    "--psum-rmw on the RTL's configuration: accumulating "
+                    "across K tiles reads the old partial sum before writing "
+                    "the new one, except on a row's first K tile.  The read "
+                    "port carries N activation bytes plus 4N old partial-sum "
+                    "bytes.  Global stall with fixed per-stream addresses.")
+        h = pd.concat([rm_, rk_]).drop_duplicates("tag")
+        h = h[h.workload.isin(ex.COMPUTE_BOUND) &
+              (h.pred_dram_ceiling >= 0.999) & ~aliasing(h)]
+        load = h.model_D_port / h.B_bytes_per_cycle
+        frac = h.pe_util / h.ideal_util
+        err = (frac - 1 / load)[load > 1].abs()
+        L += ["", "## Partial sums read back (--psum-rmw)", "",
+              f"* {len(h)} runs: below D_read = B, minimum utilization / "
+              f"stall-free {frac[load <= 1].min():.3f}; above it, |frac - "
+              f"B/D_read| mean {err.mean():.3f}, max {err.max():.3f}."]
+        for r in rows:
+            L.append(f"* {r['workload']} N={r['N']}: N/2 banks "
+                     f"{r['N/2 banks, written once']:.3f} -> "
+                     f"{r['N/2 banks, read back']:.3f}; "
+                     f"{r['ceil(5N/8) banks']} banks "
+                     f"{r['ceil(5N/8), read back']:.3f}; global stall there "
+                     f"{r['global stall, ceil(5N/8)']:.3f}.")
+        key["rtl_config_rmw"] = {
+            f"{r['workload']}_N{r['N']}": {
+                "half_N": r["N/2 banks, read back"],
+                "five_eighths": r["ceil(5N/8), read back"],
+                "lockstep_five_eighths": r["global stall, ceil(5N/8)"]}
+            for r in rows}
+        fits = [fit_row(n, S[n]) for n in ("rtlcfg_rmw_main",
+                                           "rtlcfg_rmw_knee")]
+        key["rtl_config_rmw_fit"] = {
+            r["suite"]: {k: r[k] for k in r if k != "suite"} for r in fits}
+
+    # ---- one weight register array
+    nm, nk = S.get("rtlcfg_nodb_main"), S.get("rtlcfg_nodb_knee")
+    if nm is not None and nk is not None:
+        h = pd.concat([nm, nk]).drop_duplicates("tag")
+        h = h[h.workload.isin(ex.COMPUTE_BOUND)].copy()
+        h["cap"] = h.M / (h.M + h.N)
+        s_ = h[(h.pred_dram_ceiling >= 0.999) & ~aliasing(h)]
+        load = s_.model_D_port / s_.B_bytes_per_cycle
+        frac = s_.pe_util / s_.ideal_util
+        err = (frac - 1 / load)[load > 1].abs()
+        rows = []
+        nl = S.get("rtlcfg_nodb_lockstep")
+        for wl in ex.COMPUTE_BOUND:
+            M = ex.M_OF[wl]
+            for n in ex.N_VALUES:
+                b = ex.rtl_rule(n, M)
+                d_ = h[(h.workload == wl) & (h.N == n) & (h.banks == b)]
+                l_ = nl[(nl.workload == wl) & (nl.N == n) & (nl.banks == b)]
+                rows.append({
+                    "workload": wl, "N": n, "BANKS": b,
+                    "M / (M + N)": M / (M + n),
+                    "util, decoupled": float(d_.pe_util.iloc[0]),
+                    "util, global stall": float(l_.pe_util.iloc[0]),
+                })
+        write_table(pd.DataFrame(rows), "rtl_config_nodb",
+                    "One weight register array, at the busier-port rule",
+                    "rtlcfg_nodb_*: --no-double-buffer on the RTL's "
+                    "configuration.  T = M + N, so utilization is capped at "
+                    "M / (M + N) whatever BANKS is.")
+        L += ["", "## One weight register array (rtlcfg_nodb_*)", "",
+              f"* Past the knee, |utilization / stall-free - B/D| on the "
+              f"busier port: mean {err.mean():.3f}, max {err.max():.3f}; "
+              f"below it the minimum is {frac[load <= 1].min():.3f}, relative "
+              f"to the lower stall-free value."]
+        key["rtl_config_nodb"] = {
+            f"{r['workload']}_N{r['N']}": r["util, decoupled"] for r in rows}
+
+    # ---- tiling along M and N_out
+    nt, mt = S.get("rtlcfg_ntile"), S.get("rtlcfg_mtile")
+    if nt is not None and mt is not None:
+        rows = []
+        m_only = {(r["workload"], r["N"], r["array MHz"]): r
+                  for r in m_tile_rows(mt)}
+        for r in m_tile_rows(nt):
+            old = m_only.get((r["workload"], r["N"], r["array MHz"]))
+            rows.append({
+                "workload": r["workload"], "N": r["N"], "BANKS": r["BANKS"],
+                "array MHz": r["array MHz"],
+                "M tile": r["M tile rows"], "N_out slice": r["N_out slice"],
+                "util, whole layer": r["util, whole layer"],
+                "util, M tiles only":
+                    f"{old['util, tiled']:.4f}" if old else "does not fit",
+                "util, M and N_out tiles": r["util, tiled"],
+                "model": r["model, tiled"],
+                "time ratio, M tiles only":
+                    old["time ratio"] if old else "",
+                "time ratio, M and N_out tiles": r["time ratio"],
+                "DRAM MiB, whole layer": r["DRAM MiB, whole layer"],
+                "DRAM MiB, M and N_out tiles": r["DRAM MiB, tiled"],
+            })
+        write_table(pd.DataFrame(rows), "rtl_config_n_tiling",
+                    "512-word banks, tiled along M only or along M and N_out",
+                    "Busier-port rule's banks.  N_out slices are the smallest "
+                    "legal size.  A stays in the scratchpad across the slices "
+                    "of an M tile, but A alone can exceed the capacity, so "
+                    "M tiles are still needed.")
+        L += ["", "## Tiling along N_out as well (rtlcfg_ntile)", ""]
+        for r in rows:
+            if r["array MHz"] == 250:
+                shown = r["util, M tiles only"]
+                if shown != "does not fit":
+                    shown = f"{float(shown):.3f}"
+                L.append(f"* {r['workload']} N={r['N']} BANKS={r['BANKS']}, "
+                         f"250 MHz, M tile {r['M tile']}, slice "
+                         f"{r['N_out slice']}: {r['util, whole layer']:.3f} "
+                         f"whole, {shown} M only, "
+                         f"{r['util, M and N_out tiles']:.3f} both, layer "
+                         f"time x{r['time ratio, M and N_out tiles']:.2f}.")
+        key["rtl_config_n_tiling"] = {
+            f"{r['workload']}_N{r['N']}_{r['array MHz']:.0f}MHz":
+            r["util, M and N_out tiles"] for r in rows}
+    ns1 = S.get("ntile")
+    if ns1 is not None:
+        write_table(pd.DataFrame(m_tile_rows(ns1)), "n_tiling_1rw",
+                    "512-word banks tiled along M and N_out, one shared port",
+                    "ceil(D/8) banks.")
+
+
+def rtl_config_tables(S, key):
+    """Every hypothesis again under the RTL's configuration, and
+    tables/hypotheses_rtl_config.md.  Nothing here feeds the older tables."""
+    if S.get("rtlcfg_main") is None or S.get("rtlcfg_knee") is None:
+        return
+    main, knee = S["main"], S["knee"]
+    rm, rk = S["rtlcfg_main"], S["rtlcfg_knee"]
+    cb = rtl_frame(S)
+    L = []  # lines of the hypothesis check
+
+    def scratch(d):
+        """Runs only the banks can limit (no DRAM limit, no lane aliasing)."""
+        return d[(d.pred_dram_ceiling >= 0.999) & ~aliasing(d)]
+
+    # ---- model fit
+    fits = [fit_row(n, S[n]) for n in
+            ("rtlcfg_main", "rtlcfg_knee", "rtlcfg_rulem", "rtlcfg_reuse",
+             "rtlcfg_gemv", "rtlcfg_clock", "rtlcfg_extend")
+            if S.get(n) is not None]
+    t = pd.DataFrame(fits).rename(columns={
+        "R^2": "R^2, busier port",
+        "mean |err|": "mean |err|, busier port",
+        "R^2, eq. (1) as written": "R^2, proposal's eq. (1)",
+        "mean |err|, eq. (1) as written": "mean |err|, proposal's eq. (1)"})
+    write_table(t, "rtl_config_fit", "Model vs gem5, RTL's configuration",
+                "Busier port: min(1, B / max(D_read, D_write)).  Proposal's "
+                "eq. (1): min(1, B / D) with one D for all traffic.")
+    key["rtl_config_fit"] = {r["suite"]: {k: r[k] for k in r if k != "suite"}
+                             for r in fits}
+
+    # ---- H1
+    L += ["# Hypothesis checks, RTL's configuration (auto-generated)", "",
+          "Simple-dual-port banks, weights crossing the banks once "
+          "(rtl/src on the dev_hill branch).  gem5 only: the RTL cannot run "
+          "these layers yet.", "",
+          "## H1: above 90% until delivered bandwidth reaches B, then ~B/D",
+          ""]
+    h1 = scratch(cb)
+    h1 = h1.assign(frac=h1.pe_util / h1.ideal_util)
+    res = {}
+    for name, col in (("as the proposal writes it, D = eq. (1)", "model_D"),
+                      ("on the busier port, D = max(D_read, D_write)",
+                       "model_D_port")):
+        load = h1[col] / h1.B_bytes_per_cycle
+        below, above = h1[load <= 1], h1[load > 1]
+        err = (above.frac - 1 / load[load > 1]).abs()
+        # Runs with D > B yet still above 90%: the knee is not where it says.
+        early = above[(above.frac >= 0.9) & (load[load > 1] > 1 / 0.9)]
+        res[col] = dict(below_min=float(below.frac.min()),
+                        above_mean_err=float(err.mean()),
+                        above_max_err=float(err.max()),
+                        early=len(early), runs=len(h1))
+        L += [f"* Load {name}: {len(below)} runs with D <= B, minimum "
+              f"utilization / stall-free {below.frac.min():.3f}.  "
+              f"{len(above)} runs with D > B: |utilization / stall-free - "
+              f"B/D| mean {err.mean():.3f}, max {err.max():.3f}.  Runs still "
+              f"at or above 90% past the 90% point the formula predicts: "
+              f"{len(early)}."]
+    key["rtl_config_h1"] = res
+
+    # The knee, one bank at a time, as a load on the busier port.
+    cross, rows = {}, []
+    for wl in ex.COMPUTE_BOUND:
+        vals = []
+        for n in ex.N_VALUES:
+            s_ = scratch(rk[(rk.workload == wl) & (rk.N == n)]) \
+                .sort_values("banks")
+            hit = s_[s_.pe_util >= 0.9]
+            if len(hit) and hit.banks.min() > s_.banks.min():
+                b1 = int(hit.banks.min())
+                r1 = s_[s_.banks == b1].iloc[0]
+                r0 = s_[s_.banks < b1].iloc[-1]
+                b_eq = r0.banks + (0.9 - r0.pe_util) / \
+                    (r1.pe_util - r0.pe_util) * (b1 - r0.banks)
+                vals.append(float(r1.model_D_port) / (8 * b_eq))
+        cross[wl] = float(np.mean(vals))
+        L.append(f"* {wl}: 90% crossing at max(D_read, D_write) / B = "
+                 f"{min(vals):.3f}-{max(vals):.3f} (the formula: 1.11).")
+    key["rtl_config_crossing"] = cross
+
+    # ---- the research question
+    for wl in ex.COMPUTE_BOUND:
+        M = ex.M_OF[wl]
+        for bk in ex.BANK_VALUES:
+            B = 8 * bk
+            d0 = main[(main.workload == wl) & (main.banks == bk)] \
+                .sort_values("N")
+            d1 = rm[(rm.workload == wl) & (rm.banks == bk)].sort_values("N")
+            d2 = S["rtlcfg_lockstep"]
+            d2 = d2[(d2.workload == wl) & (d2.banks == bk)].sort_values("N")
+            ns = np.arange(1.0, 200.0, 0.01)
+            T = np.maximum(M, ns)
+            D_port = np.maximum((ns * M + ns ** 2) / T, 4 * ns * M / T)
+            over = D_port / B > cross[wl]
+            rows.append({
+                "workload": wl, "BANKS": bk, "B (bytes/cycle, per port)": B,
+                "util N=8": float(d1[d1.N == 8].pe_util.iloc[0]),
+                "util N=16": float(d1[d1.N == 16].pe_util.iloc[0]),
+                "util N=24": float(d1[d1.N == 24].pe_util.iloc[0]),
+                "util N=32": float(d1[d1.N == 32].pe_util.iloc[0]),
+                "N at 90%, published (1 shared port)":
+                    crossing(d0.N, d0.pe_util),
+                "N at 90%, interpolated": crossing(d1.N, d1.pe_util),
+                "N at 90%, from the measured load":
+                    round(float(ns[np.argmax(over)]), 1) if over.any() else "",
+                "global stall: util N=8": float(d2[d2.N == 8].steady_util
+                                                .iloc[0]),
+                "global stall: util N=16": float(d2[d2.N == 16].steady_util
+                                                 .iloc[0]),
+                "global stall: util N=24": float(d2[d2.N == 24].steady_util
+                                                 .iloc[0]),
+                "global stall: util N=32": float(d2[d2.N == 32].steady_util
+                                                 .iloc[0]),
+            })
+    write_table(pd.DataFrame(rows), "rtl_config_saturation",
+                "Where the scratchpad saturates, RTL's configuration",
+                "Decoupled utilization unless the column says global stall "
+                "(steady state).  'From the measured load' converts the "
+                "knee sweep's crossing on the busier port through "
+                "max(D_read, D_write); it is derived, not a run at that N.")
+    key["rtl_config_saturation"] = {
+        f"{r['workload']}_B{r['BANKS']}":
+        r["N at 90%, from the measured load"] for r in rows}
+
+    # ---- H3
+    rows = []
+    lock = S["rtlcfg_lockstep"]
+    for wl in ex.COMPUTE_BOUND:
+        M = ex.M_OF[wl]
+        for n in ex.N_VALUES:
+            s_ = rk[(rk.workload == wl) & (rk.N == n)]
+            ceil_d = math.ceil(model.demand(n, M) / 8)
+            r = ex.rtl_rule(n, M)
+
+            def at(bk, d=s_):
+                v = d[d.banks == bk]
+                return float(v.pe_util.iloc[0]) if len(v) else float("nan")
+            lk = lock[(lock.workload == wl) & (lock.N == n)]
+            rows.append({
+                "workload": wl, "N": n, "stall-free":
+                float(s_.ideal_util.iloc[0]),
+                "ceil(D/8)": ceil_d, "util at ceil(D/8)": at(ceil_d),
+                "util at 25% fewer": at(math.floor(0.75 * ceil_d)),
+                "busier-port rule": r, "util at rule": at(r),
+                "util at rule, 25% fewer": at(math.floor(0.75 * r)),
+                "global stall, util at rule": at(r, lk),
+                "BRAM36 saved against ceil(D/8)": ceil_d - r,
+            })
+    t = pd.DataFrame(rows)
+    write_table(t, "rtl_config_rule", "The bank rule, RTL's configuration",
+                "ceil(D/8) is the proposal's rule; the busier-port rule is "
+                "max(ceil(D_read/8), ceil(D_write/8)).  One BRAM36 per bank; "
+                "a bandwidth count, not a Vivado number.")
+    bound = t[~((t.workload == "bert_ffn1") & (t.N == 32))]
+    L += ["", "## H3: the bank rule restores utilization", "",
+          f"* ceil(D/8) banks (excluding the DRAM-bound BERT FFN1 N=32): "
+          f"utilization {bound['util at ceil(D/8)'].min():.3f}-"
+          f"{bound['util at ceil(D/8)'].max():.3f}.",
+          f"* 25% fewer than ceil(D/8): {bound['util at 25% fewer'].min():.3f}"
+          f"-{bound['util at 25% fewer'].max():.3f} (1 shared port: 0.66-0.80)"
+          ", so ceil(D/8) is enough but no longer the smallest count.",
+          f"* Busier-port rule: {bound['util at rule'].min():.3f}-"
+          f"{bound['util at rule'].max():.3f}; 25% fewer: "
+          f"{bound['util at rule, 25% fewer'].min():.3f}-"
+          f"{bound['util at rule, 25% fewer'].max():.3f}.",
+          f"* Global stall at the busier-port rule: "
+          f"{bound['global stall, util at rule'].min():.3f}-"
+          f"{bound['global stall, util at rule'].max():.3f}."]
+    key["rtl_config_rule"] = {
+        c: {"min": float(bound[c].min()), "max": float(bound[c].max())}
+        for c in ("util at ceil(D/8)", "util at 25% fewer", "util at rule",
+                  "util at rule, 25% fewer", "global stall, util at rule")}
+
+    rulem = S.get("rtlcfg_rulem")
+    if rulem is not None:
+        rows = []
+        for r_ in rulem.itertuples():
+            rows.append(dict(
+                M=r_.M, N=r_.N, BANKS=r_.banks,
+                rule=ex.rtl_rule(r_.N, r_.M),
+                ceil_D8=math.ceil(model.demand(r_.N, r_.M) / 8),
+                frac=r_.pe_util / r_.ideal_util, pe_util=r_.pe_util))
+        d = pd.DataFrame(rows)
+        d = d[~aliasing(d.rename(columns={"BANKS": "banks"}))]
+        d["kind"] = np.select(
+            [d.BANKS == d.rule, d.BANKS == np.floor(0.75 * d.rule),
+             d.BANKS == d.ceil_D8, d.BANKS == np.floor(0.75 * d.ceil_D8)],
+            ["busier-port rule", "25% fewer than the rule", "ceil(D/8)",
+             "25% fewer than ceil(D/8)"], default="other")
+        write_table(d.sort_values(["M", "N", "BANKS"])
+                    [["M", "N", "BANKS", "kind", "pe_util", "frac"]],
+                    "rtl_config_rule_vs_reuse",
+                    "The rules across reuse M, RTL's configuration",
+                    "Weights free of DRAM.  frac = utilization / stall-free. "
+                    "A count that fits two kinds is listed under the first.")
+        g = d[d.kind != "other"].groupby("kind").frac.agg(["count", "min",
+                                                           "mean", "max"])
+        for k, v in g.iterrows():
+            L.append(f"* Every reuse M, {k}: {int(v['count'])} runs, "
+                     f"utilization / stall-free {v['min']:.3f}-{v['max']:.3f}"
+                     f" (mean {v['mean']:.3f}).")
+        key["rtl_config_rule_vs_reuse"] = {
+            k: {c: float(v[c]) for c in ("count", "min", "mean", "max")}
+            for k, v in g.iterrows()}
+
+    # ---- H2
+    gm = S.get("rtlcfg_gemv")
+    if gm is not None:
+        rows = []
+        for (n, clk), v in gm.groupby(["N", "clock_hz"]):
+            v = v.sort_values("banks")
+            cap = float(v.ideal_util.iloc[0])
+            top = float(v.pe_util.max())
+            flat = v[v.pe_util >= 0.99 * top]
+            rows.append({
+                "N": n, "array MHz": clk / 1e6, "1/N cap": cap,
+                "util at 32 banks": float(v[v.banks == 32].pe_util.iloc[0]),
+                "util at 1 bank": float(v[v.banks == 1].pe_util.iloc[0]),
+                "fewest BANKS within 1% of the top": int(flat.banks.min()),
+                "D_read = N + 1 bytes/cycle": n + 1,
+                "banks that needs": math.ceil((n + 1) / 8),
+                "model": float(v[v.banks == 32].pred_util.iloc[0]),
+            })
+        t = pd.DataFrame(rows)
+        write_table(t, "rtl_config_gemv", "M = 1, RTL's configuration",
+                    "At 250 MHz DRAM is ample and utilization meets the 1/N "
+                    "cap; at 2 GHz DRAM sets it.  Above a floor of "
+                    "ceil((N+1)/8) banks BANKS stops mattering.")
+        lo, hi = t[t["array MHz"] == 250], t[t["array MHz"] == 2000]
+        L += ["", "## H2: for M = 1, 1/N and DRAM bandwidth, regardless of "
+              "BANKS", "",
+              f"* 250 MHz: utilization at 32 banks / the 1/N cap = "
+              f"{(lo['util at 32 banks'] / lo['1/N cap']).min():.3f}-"
+              f"{(lo['util at 32 banks'] / lo['1/N cap']).max():.3f}.",
+              f"* 2 GHz: utilization at 32 banks / model = "
+              f"{(hi['util at 32 banks'] / hi['model']).min():.3f}-"
+              f"{(hi['util at 32 banks'] / hi['model']).max():.3f}.",
+              "* Fewest banks within 1% of the top, 250 MHz: " +
+              ", ".join(f"N={r.N}: {r._6}" for r in lo.itertuples()) +
+              "; 2 GHz: " +
+              ", ".join(f"N={r.N}: {r._6}" for r in hi.itertuples()) + "."]
+        key["rtl_config_gemv"] = {
+            f"N{r['N']}_{r['array MHz']:.0f}MHz":
+            {k: r[k] for k in ("1/N cap", "util at 32 banks", "util at 1 bank",
+                               "fewest BANKS within 1% of the top")}
+            for r in rows}
+
+    # ---- the global stall
+    lk = S["rtlcfg_lockstep"]
+    lk = lk[lk.workload == "resnet50_conv3x"]
+    dec = cb[cb.workload == "resnet50_conv3x"]
+    j = lk.merge(dec[["N", "banks", "steady_util"]], on=["N", "banks"],
+                 suffixes=("", "_dec"), how="left")
+    t = j[["N", "banks", "steady_util_dec", "steady_util",
+           "pred_lockstep_staircase", "pred_lockstep_fixed_addr"]] \
+        .rename(columns={"steady_util_dec": "decoupled steady",
+                         "steady_util": "global stall steady",
+                         "pred_lockstep_staircase": "staircase",
+                         "pred_lockstep_fixed_addr": "address-map model"}) \
+        .sort_values(["N", "banks"])
+    write_table(t, "rtl_config_stall",
+                "Decoupled vs. global stall, RTL's configuration (ResNet-50)",
+                "staircase = 1 / max(ceil(ceil(N/8) / BANKS), "
+                "ceil((N/2) / BANKS)).  Reads and writes no longer meet in "
+                "a bank, so activation and partial-sum words stop colliding.")
+
+    # ---- one weight register array, as the RTL has today
+    nd = S.get("rtlcfg_nodb")
+    if nd is not None:
+        j = nd[nd.double_buffer == 0].merge(
+            nd[nd.double_buffer == 1][["workload", "N", "banks", "pe_util"]],
+            on=["workload", "N", "banks"], suffixes=("", "_db"))
+        j["M/T"] = j.M / (j.M + j.N)
+        write_table(j[["workload", "M", "N", "banks", "pe_util_db", "pe_util",
+                       "M/T"]].rename(columns={
+                           "pe_util_db": "shadow registers",
+                           "pe_util": "one register array"})
+                    .sort_values(["workload", "N", "banks"]),
+                    "rtl_config_single_buffer",
+                    "One weight register array, RTL's configuration",
+                    "rtl/src has one weights register array, loaded after "
+                    "reset, which is --no-double-buffer: T = M + N, so "
+                    "utilization cannot pass M / (M + N).")
+        cbn = j[j.workload.isin(ex.COMPUTE_BOUND) & (j.pred_dram_ceiling >=
+                                                     0.999)]
+        L += ["", "## What the RTL's one weight register array changes", "",
+              "* Compute-bound runs below 90% purely from M / (M + N) < 0.9: "
+              + (", ".join(f"{r.workload} N={r.N} BANKS={r.banks}: "
+                           f"{r.pe_util:.3f}"
+                           for r in cbn[cbn["M/T"] < 0.9].itertuples())
+                 or "none") + "."]
+
+    # ---- 512-word banks
+    mt = S.get("rtlcfg_mtile")
+    if mt is not None:
+        rows = m_tile_rows(mt)
+        for wl in ex.COMPUTE_BOUND:
+            for n in ex.N_VALUES:
+                b = ex.rtl_rule(n, ex.M_OF[wl])
+                if not ex.m_tile_fits(wl, n, b):
+                    rows.append({"workload": wl, "N": n, "BANKS": b,
+                                 "array MHz": "any",
+                                 "M tile rows": "does not fit"})
+        write_table(pd.DataFrame(rows), "rtl_config_m_tiling",
+                    "512-word banks, RTL's configuration",
+                    "The busier-port rule's banks with --spm-depth 512 "
+                    "--m-tile auto.  'does not fit' means one row and the "
+                    "weight prefetch exceed BANKS x 512 words.  Note that "
+                    "rtl/src currently sizes banks at N words, for one weight "
+                    "tile only.")
+        L += ["", "## Threat: bank depth (512 words)", ""]
+        for r in rows:
+            if r["array MHz"] == 250:
+                L.append(f"* {r['workload']} N={r['N']} BANKS={r['BANKS']}, "
+                         f"250 MHz, M tile {r['M tile rows']}: "
+                         f"{r['util, whole layer']:.3f} -> "
+                         f"{r['util, tiled']:.3f}, layer time x"
+                         f"{r['time ratio']:.2f}.")
+            elif r["array MHz"] == "any":
+                L.append(f"* {r['workload']} N={r['N']} BANKS={r['BANKS']}: "
+                         "does not fit.")
+
+    option_tables(S, key, L)
+    os.makedirs(TAB, exist_ok=True)
+    with open(os.path.join(TAB, "hypotheses_rtl_config.md"), "w") as f:
+        f.write("\n".join(L) + "\n")
+    print("  results/tables/hypotheses_rtl_config.md")
 
 
 def fit_row(name, df):
@@ -1782,7 +2990,11 @@ def tables(S):
     key["runs"] = {n: (len(S[n]) if S.get(n) is not None else 0)
                    for n in ex.SUITES}
     every = pd.concat([S[n] for n in ex.SUITES if S.get(n) is not None])
-    key["runs"]["unique"] = int(every.tag.nunique())
+    # "unique" stays the count of the default model's suites, so that it
+    # compares with results made before the options existed.
+    base = every[every.suite.isin(ex.BASELINE_SUITES)]
+    key["runs"]["unique"] = int(base.tag.nunique())
+    key["runs"]["unique_with_options"] = int(every.tag.nunique())
     key["runs"]["verify_failures"] = int(
         (every.verify_mismatches != 0).sum())
     b32 = main[main.banks == 32]
@@ -1844,6 +3056,8 @@ def tables(S):
         key["host_vs_standalone_max_abs_diff"] = {
             w: float(v.abs().max()) for w, v in
             (j.pe_util_host - j.pe_util_standalone).groupby(j.workload)}
+    extension_tables(S, key)
+    rtl_config_tables(S, key)
     import json
     with open(os.path.join(DATA, "key_results.json"), "w") as f:
         json.dump(key, f, indent=2, default=str)
@@ -1854,13 +3068,42 @@ def tables(S):
 FIGS = ["fig1", "fig2", "fig3", "fig4", "fig5", "fig6", "fig7", "fig8",
         "fig9", "fig10", "fig11", "fig12", "fig13", "fig14", "fig15",
         "fig16", "fig17", "fig18", "fig19", "fig20", "fig21", "fig22",
-        "tables"]
+        "fig23", "fig24", "fig25", "fig26", "fig27", "tables"]
+
+# The figures the paper uses, per source of results.  rtlcfg leads (the RTL's
+# configuration); baseline is the conservative reference with one shared port.
+PAPER_FIGS = {
+    "rtlcfg": ["fig1", "fig2", "fig5", "fig12", "fig13", "fig15", "fig17",
+               "fig18", "fig20", "fig25", "fig26", "fig27"],
+    "baseline": ["fig1", "fig2", "fig5", "fig12", "fig13", "fig14", "fig15",
+                 "fig17", "fig18", "fig20", "fig22", "fig23"],
+}
+# Which rtlcfg suite stands in for each suite those figures read.
+PAPER_SUITES = {"main": ["rtlcfg_main"], "knee": ["rtlcfg_knee"],
+                "idealdram": ["rtlcfg_idealdram"], "reuse": ["rtlcfg_reuse"],
+                "clock": ["rtlcfg_clock", "rtlcfg_gemv"],
+                "dram": ["rtlcfg_dram"], "rulem": ["rtlcfg_rulem"],
+                "extend": ["rtlcfg_extend"]}
+
+
+def paper_inputs(S):
+    """S with the figures' suites replaced by the RTL's configuration, and
+    D in those frames taken as the busier port's."""
+    S = dict(S)
+    for name, sources in PAPER_SUITES.items():
+        parts = [S[n] for n in sources if S.get(n) is not None]
+        S[name] = pd.concat(parts).assign(
+            model_D=lambda d: d.model_D_port) if parts else None
+    return S
 
 
 def main():
-    global FORMATS
+    global FORMATS, FIG, TAB, PORT_LOAD
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", nargs="*", choices=FIGS)
+    ap.add_argument("--paper", choices=sorted(PAPER_FIGS),
+                    help="the paper's figures only, from this source of "
+                         "results, into results/paper/<source>/")
     ap.add_argument("--format", nargs="*", default=FORMATS,
                     choices=["png", "pdf", "svg"])
     args = ap.parse_args()
@@ -1869,6 +3112,16 @@ def main():
     st.setup()
 
     S = {name: load(name) for name in ex.SUITES}
+    if args.paper:
+        want = set(PAPER_FIGS[args.paper])
+        FIG = os.path.join(RESULTS, "paper", args.paper)
+        # Tables those figures write stay with them, not over results/tables.
+        TAB = os.path.join(FIG, "tables")
+        if args.paper == "rtlcfg":
+            PORT_LOAD = True
+            S = paper_inputs(S)
+        print(f"the paper's figures from {args.paper}, into "
+              f"{os.path.relpath(FIG, RESULTS)}/")
     main_df = S["main"]
     if main_df is None:
         sys.exit("results/data/main.csv missing: run  make data  first")
@@ -1925,6 +3178,17 @@ def main():
         fig21_extended(main_df, S["banks"], S["extend"])
     if "fig22" in want and need("policy"):
         fig22_bank_policy(S["policy"])
+    if "fig23" in want and need("knee", "lockstep"):
+        fig23_lockstep(main_df, S["knee"], S["lockstep"])
+    if "fig24" in want and need("knee", "bankports"):
+        fig24_bank_ports(S["knee"], S["bankports"])
+    if "fig25" in want and need("rtlcfg_main", "rtlcfg_knee"):
+        fig25_rtl_config(S)
+    if "fig26" in want and need("rtlcfg_main", "rtlcfg_knee",
+                                "rtlcfg_lockstep"):
+        fig26_rtl_stall(S)
+    if "fig27" in want and need("psumopts"):
+        fig27_psum_options(S["psumopts"])
     if "tables" in want:
         tables(S)
 

@@ -1,6 +1,14 @@
+//---------------------------------------------------------------------------//
+// EEL5764 Computer Architecture                                             //
+//---------------------------------------------------------------------------//
+// Project     : Parameterized SRAM Scratchpad Array                         //
+// Filename    : systolic_host.c                                             //
+// Engineers   : Evan Espino-DeJesus, Tyla Hart, Kasey Hill and James Woelke //
+// Group       : #4                                                          //
+// Description : RISC-V host program for the SystolicAccel                   //
+//---------------------------------------------------------------------------//
 /*
- * EEL5764 Group 4 -- RISC-V host program for the SystolicAccel
- * (proposal phase 3: host-driven mode).  Runs in gem5 SE mode on a
+ * Proposal phase 3 (host-driven mode).  Runs in gem5 SE mode on a
  * RiscvTimingSimpleCPU.
  *
  *   systolic_host MODE A.bin W.bin C_golden.bin M K N_OUT \
@@ -20,6 +28,14 @@
  *   dump 2  verification and exit
  *
  * Exit status 0 = the output matched C_golden.bin.
+ *
+ * Built with -DSYSTOLIC_HOST_EXT (systolic_host_ext) the program takes two
+ * more optional arguments after PIO_VA:
+ *   split-stats  dump statistics once more between programming the registers
+ *                and polling, so dump 1 is the setup and dump 2 the wait
+ *   prepacked    the packed weights are already in DRAM (the config loads
+ *                W_packed_N<N>.bin): skip reading W and packing it
+ * The default build has neither, so it stays byte-identical.
  */
 
 #include <fcntl.h>
@@ -110,6 +126,20 @@ static inline void zero_row(int8_t *dst, uint64_t n)
 
 int main(int argc, char **argv)
 {
+#ifdef SYSTOLIC_HOST_EXT
+    int split_stats = 0, prepacked = 0;
+    while (argc > 11) {
+        --argc;
+        if (strcmp(argv[argc], "split-stats") == 0) {
+            split_stats = 1;
+        } else if (strcmp(argv[argc], "prepacked") == 0) {
+            prepacked = 1;
+        } else {
+            fprintf(stderr, "unknown option %s\n", argv[argc]);
+            return 2;
+        }
+    }
+#endif
     if (argc != 11) {
         fprintf(stderr, "usage: %s accel|sw A.bin W.bin C_golden.bin M K "
                 "N_OUT SHARED_VA SHARED_PA PIO_VA\n", argv[0]);
@@ -141,10 +171,17 @@ int main(int argc, char **argv)
         return 2;
     }
     read_file(argv[2], A, M * K);
+#ifdef SYSTOLIC_HOST_EXT
+    if (!prepacked)
+#endif
     read_file(argv[3], W, K * NOUT);
     read_file(argv[4], golden, M * NOUT * 4);
 
+#ifdef SYSTOLIC_HOST_EXT
+    if (!sw && !prepacked) {
+#else
     if (!sw) {
+#endif
         /* Pack W into N x N tiles, tile t = nb * nkb + kb, zero padded:
          * tile row r holds W[kb*N + r][nb*N .. nb*N + N - 1].  Every byte
          * of every tile is written (data or zero padding). */
@@ -210,6 +247,10 @@ int main(int argc, char **argv)
         wr(REG_W, shared_pa + w_off);
         wr(REG_C, shared_pa + c_off);
         wr(REG_CTRL, 1);
+#ifdef SYSTOLIC_HOST_EXT
+        if (split_stats)
+            m5_dump_reset_stats();
+#endif
         do {
             status = rd(REG_STATUS);
             ++polls;

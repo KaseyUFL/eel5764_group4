@@ -1,7 +1,7 @@
 # EEL5764 Group 4 -- scratchpad saturation of N x N systolic arrays, gem5.
 #
 #   make help        list the targets
-#   make all         build everything, run all 772 simulations, plot (~1.5 h)
+#   make all         build everything, run all simulations, plot (~2.5 h)
 #
 # Settings: give them on the command line (make data SIM_JOBS=8) or put
 # them in env.local.sh (see env.local.sh.example).
@@ -37,11 +37,12 @@ BANKS ?= 8
 ARGS ?=
 SUITES ?=
 PLOTS ?=
+PAPER_SOURCE ?= rtlcfg
 FORCE ?=
 REF ?=
 
-.PHONY: help all deps venv build gem5 host zig workloads smoke run list data \
-        figures model check clean distclean
+.PHONY: help all deps venv build gem5 host zig workloads prepacked smoke run \
+        list data figures paper-figures model check regress clean distclean
 
 help:  ## this list
 	@echo "Targets (run in this order the first time, or just: make all):"
@@ -54,8 +55,9 @@ help:  ## this list
 	@echo "  make data FORCE=1          # rerun after changing the model"
 	@echo "  make figures PLOTS='fig1 fig17 tables'"
 	@echo "  make check REF=path/to/other/results"
+	@echo "  make run WL=resnet50_conv3x N=16 BANKS=8 ARGS='--stall-model lockstep'"
 
-all: deps build data figures  ## everything: check, build, simulate (about 1 h), plot
+all: deps build data figures  ## everything: check, build, simulate (about 2 h), plot
 
 venv:  ## Python packages (requirements.txt) in .venv, used automatically
 	cd $(ROOT); python3 -m venv .venv; \
@@ -95,6 +97,15 @@ workloads: $(WL_INDEX)  ## generate the workload files (seeded, about 40 MB)
 $(WL_INDEX): workloads/gen_workloads.py workloads/workloads.yaml
 	$(ENV) "$$PYTHON" workloads/gen_workloads.py
 
+# Packed weight tiles for --prepacked-weights (about 150 MB).
+PREPACKED := $(dir $(WL_INDEX)).prepacked
+
+prepacked: $(PREPACKED)  ## packed weights for --prepacked-weights
+
+$(PREPACKED): $(WL_INDEX)
+	$(ENV) "$$PYTHON" workloads/gen_workloads.py --prepack
+	touch "$@"
+
 smoke: $(HOST_BIN) $(WL_INDEX) | $(GEM5_BIN)  ## quick test: 8 small runs, all must verify
 	$(ENV) bash scripts/run_all_workloads.sh 8 4 --rtl
 
@@ -104,12 +115,15 @@ run: $(HOST_BIN) $(WL_INDEX) | $(GEM5_BIN)  ## one run: WL=, N=, BANKS=, ARGS=
 list:  ## the experiment suites and their run counts
 	$(ENV) "$$PYTHON" analysis/collect.py --list
 
-data: $(HOST_BIN) $(WL_INDEX) | $(GEM5_BIN)  ## run the experiments -> results/data/ (SUITES=, FORCE=1)
+data: $(HOST_BIN) $(WL_INDEX) $(PREPACKED) | $(GEM5_BIN)  ## run the experiments -> results/data/ (SUITES=, FORCE=1)
 	$(ENV) "$$PYTHON" analysis/collect.py -j "$$SIM_JOBS" \
 	    $(if $(FORCE),--force) $(SUITES)
 
 figures:  ## figures, tables, key_results.json -> results/ (PLOTS=)
 	$(ENV) "$$PYTHON" analysis/plot_curves.py $(if $(PLOTS),--only $(PLOTS))
+
+paper-figures:  ## the paper's figures, from rtlcfg_* (PAPER_SOURCE=baseline: one port)
+	$(ENV) "$$PYTHON" analysis/plot_curves.py --paper $(PAPER_SOURCE)
 
 model:  ## print the analytical model's predictions (Table I)
 	$(ENV) "$$PYTHON" analysis/model.py
@@ -122,6 +136,9 @@ check:  ## compare results/ with a reference copy (REF=dir)
 	    exit 1; \
 	fi; \
 	"$$PYTHON" analysis/compare_results.py "$$ref" "$$RESULTS_DIR"
+
+regress: $(HOST_BIN) $(WL_INDEX) | $(GEM5_BIN)  ## default model vs analysis/golden_stats.csv, exactly (1 min)
+	$(ENV) bash analysis/regress.sh
 
 clean:  ## delete build/ (raw gem5 runs and scratch output)
 	rm -rf $(ROOT)/build

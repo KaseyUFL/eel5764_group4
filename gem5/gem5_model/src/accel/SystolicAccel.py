@@ -1,4 +1,12 @@
-# EEL5764 Group 4 -- SystolicAccel SimObject declaration.
+#-----------------------------------------------------------------------------#
+# EEL5764 Computer Architecture                                               #
+#-----------------------------------------------------------------------------#
+# Project     : Parameterized SRAM Scratchpad Array                           #
+# Filename    : SystolicAccel.py                                              #
+# Engineers   : Evan Espino-DeJesus, Tyla Hart, Kasey Hill and James Woelke   #
+# Group       : #4                                                            #
+# Description : SystolicAccel SimObject declaration                           #
+#-----------------------------------------------------------------------------#
 #
 # A weight-stationary INT8 N x N systolic array that streams one GEMM
 #   C[M x Nout] = A[M x K] * W[K x Nout]
@@ -93,6 +101,72 @@ class SystolicAccel(ClockedObject):
         "request every cycle (supply = 8*BANKS bytes/cycle, eq. 2). "
         "'lane': one queue per edge lane, 1 word/lane/cycle, lanes contend "
         "for banks in the crossbar (lockstep-RTL-like)",
+    )
+    stall_model = Param.String(
+        "decoupled",
+        "'decoupled': per-bank queues, read-ahead and a write buffer sit "
+        "between banks and array. 'lockstep': a schedule step issues all "
+        "its words at once and the next step waits until every bank has "
+        "served its share, so a step takes as many cycles as the busiest "
+        "bank has words",
+    )
+    bank_ports = Param.String(
+        "1rw",
+        "'1rw': reads and writes share one 8-byte port per bank. '1r1w': "
+        "simple dual port, one read port and one write port per bank "
+        "working in the same cycle (spm_read_alias must be set)",
+    )
+    spm_read_alias = Param.Addr(
+        0,
+        "1r1w only: address offset of the read-port SimpleMemory objects "
+        "from the write-port ones (they hold the same data)",
+    )
+    weight_store = Param.String(
+        "spm",
+        "Where weight tiles cross the banks. 'spm': DMA write and array "
+        "read (2 crossings, D_fill). 'fill_bypass': the DMA deposits the "
+        "tile over a dedicated path, the array reads it through the banks "
+        "(1 crossing, eq. 1). 'separate': a dedicated staging buffer "
+        "outside the banks (0 crossings)",
+    )
+    bank_hash = Param.String(
+        "modulo",
+        "Word to bank map. 'modulo': word w is in bank w mod BANKS. 'xor': "
+        "with row r = w div BANKS, bank (w + (r ^ (r >> s))) mod BANKS, "
+        "s = ceil(log2(BANKS)). Needs bank_mapping='modulo'",
+    )
+    m_tile = Param.Unsigned(
+        0,
+        "Host-driven: process A in tiles of this many rows (0 = off). Each "
+        "tile loads A, runs every weight tile and stores C. Rows * K and "
+        "rows * N_out * 4 must be multiples of the 64-byte line",
+    )
+    n_tile = Param.Unsigned(
+        0,
+        "Host-driven: process the output columns in slices of this many "
+        "columns (0 = off, a multiple of N and of 16). Each slice runs its "
+        "weight tiles over the A in the scratchpad and stores its C",
+    )
+    psum_rmw = Param.Bool(
+        False,
+        "Accumulating across K tiles reads the old partial sum through the "
+        "bank's read port before writing the new one (no read on a row's "
+        "first K tile)",
+    )
+    psum_store = Param.String(
+        "spm",
+        "'spm': partial sums are written through the bank ports. 'external': "
+        "they accumulate outside the counted banks and use no bank port "
+        "during compute",
+    )
+    bank_trace_file = Param.String(
+        "", "If set, write one CSV row per compute-phase cycle here"
+    )
+    w_prepacked_file = Param.String(
+        "", "Host-driven: packed weight tiles to load into DRAM at time 0"
+    )
+    w_prepacked_addr = Param.Addr(
+        0, "DRAM address for w_prepacked_file"
     )
 
     spm_ports = VectorRequestPort(

@@ -4,6 +4,7 @@
 /third_party/
 /workloads/out/
 /gem5_model/host/systolic_host
+/gem5_model/host/systolic_host_ext
 
 # Machine-specific settings (copy env.local.sh.example)
 /env.local.sh

@@ -30,3 +30,6 @@ fi
 mkdir -p "$(dirname "$OUT")"
 "${RISCV_CC_CMD[@]}" "${FLAGS[@]}" -o "$OUT" "$SRC"
 echo "built $OUT ($(file -b "$OUT" | cut -d, -f1-2))"
+# The variant with --split-host-stats and --prepacked-weights support.
+"${RISCV_CC_CMD[@]}" "${FLAGS[@]}" -DSYSTOLIC_HOST_EXT -o "${OUT}_ext" "$SRC"
+echo "built ${OUT}_ext"

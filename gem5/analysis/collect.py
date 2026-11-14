@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
-# EEL5764 Group 4 -- run the gem5 experiments and gather the data points.
+#-----------------------------------------------------------------------------#
+# EEL5764 Computer Architecture                                               #
+#-----------------------------------------------------------------------------#
+# Project     : Parameterized SRAM Scratchpad Array                           #
+# Filename    : collect.py                                                    #
+# Engineers   : Evan Espino-DeJesus, Tyla Hart, Kasey Hill and James Woelke   #
+# Group       : #4                                                            #
+# Description : Runs the gem5 experiment suites and gathers data              #
+#-----------------------------------------------------------------------------#
 #
-#   make data                                  # every suite (about 1 h)
+#   make data                                  # every suite (about 2 h)
 #   make data SUITES="main knee"               # some suites
 #   make list                                  # show suites
 #   make data FORCE=1                          # rerun, no cache
@@ -15,6 +23,8 @@
 # main and banks) is simulated once.  Finished runs are reused, so an
 # interrupted collection can simply be restarted; use --force after
 # rebuilding gem5 or changing model defaults.
+#
+# A run that fails does not stop the others; collect reports it at the end.
 #
 # Output: results/data/<suite>.csv (or $RESULTS_DIR/data), one row per run,
 # with every column of
@@ -80,7 +90,9 @@ def command(p, d):
     elif p["mode"] == "sw":
         cmd += ["--mode", "sw"]
     for k, v in sorted(p["opts"].items()):
-        cmd += [experiments.OPT_FLAGS[k], str(v)]
+        cmd.append(experiments.OPT_FLAGS[k])
+        if k not in experiments.OPT_FLAG_ONLY:
+            cmd.append(str(v))
     if not p["double_buffer"]:
         cmd.append("--no-double-buffer")
     if p["ideal_spm"]:
@@ -158,6 +170,12 @@ def main():
     for pts in suites.values():
         for p in pts:
             uniq.setdefault(p["tag"], p)
+    for p in uniq.values():
+        if "prepacked_weights" in p["opts"] and not os.path.exists(
+                os.path.join(WL_DIR, p["workload"],
+                             f"W_packed_N{p['N']}.bin")):
+            sys.exit(f"packed weights missing for {p['tag']}; "
+                     "run: make prepacked")
     # Longest runs first (software baselines, then the GEMV runs whose
     # host packs 16 MiB of weights), so they overlap with the short ones.
     todo = sorted(uniq.values(), key=lambda p: (

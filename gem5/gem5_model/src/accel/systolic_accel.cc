@@ -1,6 +1,13 @@
+//---------------------------------------------------------------------------//
+// EEL5764 Computer Architecture                                             //
+//---------------------------------------------------------------------------//
+// Project     : Parameterized SRAM Scratchpad Array                         //
+// Filename    : systolic_accel.cc                                           //
+// Engineers   : Evan Espino-DeJesus, Tyla Hart, Kasey Hill and James Woelke //
+// Group       : #4                                                          //
+// Description : SystolicAccel implementation                                //
+//---------------------------------------------------------------------------//
 /*
- * EEL5764 (Fall 2026) Group 4 -- SystolicAccel implementation.
- *
  * Static schedule (array cycles, before any stall), tile t = 0..nTiles-1,
  * T = max(M, N) with double buffering or M + N without it:
  *
@@ -17,6 +24,13 @@
  * otherwise the whole array stalls for this clock (a global stall).
  * Reads are issued up to `lookahead` array cycles early, which models the
  * address-generation pipeline in front of the SRAM.
+ *
+ * With stall_model = "lockstep" the same schedule runs without any of that
+ * elasticity: a step's activation, weight and partial-sum words all go to
+ * the banks at once, the next step waits until every bank has accepted its
+ * share, and the only thing between address generation and the array is the
+ * fixed bank read pipeline.  A step takes as many cycles as the busiest bank
+ * has words.
  *
  * Tiles are ordered nb-outer / kb-inner so each output block accumulates in
  * the SPM accumulator region across the K dimension.  Weight tiles are
@@ -96,6 +110,8 @@ SystolicAccel::LanePort::trySend()
     auto *st = pkt->findNextSenderState<AccessState>();
     if (st)
         st->sent = curTick();
+    // The memory turns the packet into a response inside sendTimingReq.
+    const bool is_read = pkt->isRead();
     if (!sendTimingReq(pkt)) {
         waitRetry = true;
         owner.stats.laneRetries++;
@@ -103,6 +119,24 @@ SystolicAccel::LanePort::trySend()
     }
     if (st && st->bank >= 0)
         owner.stats.bankAccesses[st->bank]++;
+    if (st && owner.lockstep) {
+        if (st->stream == Stream::Act || st->stream == Stream::Weight ||
+            st->stream == Stream::PsumRead)
+            owner.stepReadsUnsent--;
+        else if (st->stream == Stream::Psum)
+            owner.stepWritesUnsent--;
+    }
+    if (st && st->bank >= 0 && owner.traceOut &&
+        owner.phase == Phase::Compute) {
+        TraceOp &op = owner.traceOps[st->bank];
+        if (is_read) {
+            op.read = true;
+            op.readRow = st->row;
+        } else {
+            op.write = true;
+            op.writeRow = st->row;
+        }
+    }
     queue.pop_front();
     if (frontReads)
         frontReads--;
@@ -192,11 +226,21 @@ SystolicAccel::SystolicAccel(const Params &p)
       perBank(p.arbitration == "bank"),
       moduloBanks(p.bank_mapping == "modulo"),
       readsFirst(p.bank_policy == "reads_first"),
+      lockstep(p.stall_model == "lockstep"),
+      sdpPorts(p.bank_ports == "1r1w"),
+      xorHash(p.bank_hash == "xor"),
+      weightStore(p.weight_store == "separate" ? WeightStore::Separate :
+                  p.weight_store == "fill_bypass" ? WeightStore::FillBypass :
+                                                    WeightStore::Spm),
+      hashShift(p.spm_banks > 1 ? ceilLog2(p.spm_banks) : 1),
+      mTile(p.m_tile), nTile(p.n_tile), psumRmw(p.psum_rmw),
+      psumExternal(p.psum_store == "external"),
       idealSpm(p.ideal_spm), idealDram(p.ideal_dram), verify(p.verify),
       hostDriven(p.host_driven),
       maxCycles(p.max_cycles),
       spmBase(p.spm_base), spmSize(p.spm_size),
       bankBytes(p.spm_size / std::max(1u, p.spm_banks)),
+      readAlias(p.bank_ports == "1r1w" ? p.spm_read_alias : 0),
       pioAddr(p.pio_addr), pioSize(p.pio_size),
       pioLatency(p.pio_latency),
       requestorId(p.system->getRequestorId(this)),
@@ -220,6 +264,28 @@ SystolicAccel::SystolicAccel(const Params &p)
              "bank_mapping must be 'interleave' or 'modulo'");
     fatal_if(p.bank_policy != "fifo" && p.bank_policy != "reads_first",
              "bank_policy must be 'fifo' or 'reads_first'");
+    fatal_if(p.stall_model != "decoupled" && p.stall_model != "lockstep",
+             "stall_model must be 'decoupled' or 'lockstep'");
+    fatal_if(lockstep && idealSpm,
+             "stall_model='lockstep' needs a real scratchpad, not ideal_spm");
+    fatal_if(p.bank_ports != "1rw" && p.bank_ports != "1r1w",
+             "bank_ports must be '1rw' or '1r1w'");
+    fatal_if(sdpPorts && !p.spm_read_alias,
+             "bank_ports='1r1w' needs spm_read_alias");
+    fatal_if(p.weight_store != "spm" && p.weight_store != "fill_bypass" &&
+             p.weight_store != "separate",
+             "weight_store must be 'spm', 'fill_bypass' or 'separate'");
+    fatal_if(p.bank_hash != "modulo" && p.bank_hash != "xor",
+             "bank_hash must be 'modulo' or 'xor'");
+    fatal_if(xorHash && !moduloBanks,
+             "bank_hash='xor' needs bank_mapping='modulo'");
+    fatal_if(mTile && !hostDriven, "m_tile needs a host-driven layer");
+    fatal_if(nTile && !hostDriven, "n_tile needs a host-driven layer");
+    fatal_if(p.psum_store != "spm" && p.psum_store != "external",
+             "psum_store must be 'spm' or 'external'");
+    fatal_if(psumRmw && psumExternal,
+             "psum_rmw reads through the bank ports, psum_store='external' "
+             "does not use them");
     fatal_if(!spmBanks, "spm_banks must be >= 1");
     fatal_if(!moduloBanks && (spmBanks & (spmBanks - 1)),
              "spm_banks (%d) is not a power of two: use "
@@ -227,13 +293,14 @@ SystolicAccel::SystolicAccel(const Params &p)
     fatal_if(moduloBanks && (spmSize % (8 * spmBanks)),
              "spm_size must be a multiple of 8 * spm_banks");
 
-    const unsigned want = perBank ? spmBanks
+    const unsigned want = perBank ? spmBanks * (sdpPorts ? 2 : 1)
                                   : actLanes + wgtLanes + psumLanes +
                                     dmaLanes;
     fatal_if(p.port_spm_ports_connection_count != want,
              "SystolicAccel (N=%d, %s arbitration) needs exactly %d "
-             "spm_ports (bank: one per bank; lane: N/8 act + N/8 weight + "
-             "N/2 psum + dma_lanes), got %d", N, p.arbitration, want,
+             "spm_ports (bank: one per bank, two with bank_ports=1r1w; "
+             "lane: N/8 act + N/8 weight + N/2 psum + dma_lanes), got %d",
+             N, p.arbitration, want,
              p.port_spm_ports_connection_count);
     for (unsigned i = 0; i < want; ++i) {
         lanes.emplace_back(new LanePort(
@@ -250,6 +317,15 @@ SystolicAccel::SystolicAccel(const Params &p)
         r.vals.resize(N);
     dmaRemaining.assign(weightSlots, 0);
     dmaLinesLeft.assign(weightSlots, 0);
+    if (weightStore == WeightStore::Separate)
+        wStage.resize(uint64_t(weightSlots) * N * N);
+    if (!p.bank_trace_file.empty()) {
+        traceOut = std::make_unique<std::ofstream>(p.bank_trace_file);
+        fatal_if(!*traceOut, "SystolicAccel: cannot write '%s'",
+                 p.bank_trace_file);
+        traceOps.resize(spmBanks);
+        writeTraceHeader();
+    }
 
     regs[RegArrayDim / 8] = N;
     if (!hostDriven) {
@@ -274,7 +350,9 @@ SystolicAccel::configure(uint64_t m, uint64_t k, uint64_t n)
     // SPM layout: [A blocked by kb][weight slots][C accumulators]
     aBase = spmBase;
     wBase = align64(aBase + nKb * M * N);
-    cBase = align64(wBase + uint64_t(weightSlots) * N * N);
+    const uint64_t slot_bytes = weightStore == WeightStore::Separate
+        ? 0 : uint64_t(weightSlots) * N * N;
+    cBase = align64(wBase + slot_bytes);
     spmEnd = cBase + nNb * M * N * 4;
     fatal_if(spmEnd > spmBase + spmSize,
              "Layer %dx%dx%d needs %d bytes of scratchpad but spm_size is "
@@ -285,6 +363,10 @@ SystolicAccel::configure(uint64_t m, uint64_t k, uint64_t n)
     const uint64_t s_last = doubleBuffer ? nTiles * T
                                          : (nTiles - 1) * T + N + 1;
     schedEnd = s_last + M - 1 + 2 * N;
+
+    const uint64_t s_first = doubleBuffer ? T : N + 1;
+    ssStart = s_first + 2 * N - 1;
+    ssEnd = s_last + M - 1;
 
     acc.assign(nNb * M * N, 0);
     dmaDone.assign(nTiles, false);
@@ -309,6 +391,7 @@ SystolicAccel::resetRunState()
     aLines = aLinesIssued = aLinesDone = aPending = 0;
     cChunks = cChunksIssued = cDramPending = 0;
     cInFlight.clear();
+    stepReadsUnsent = stepWritesUnsent = 0;
 }
 
 Port &
@@ -343,6 +426,7 @@ SystolicAccel::startup()
     if (hostDriven) {
         inform("SystolicAccel: N=%d, host-driven, registers at %#x",
                N, pioAddr);
+        loadPrepackedWeights();
         return;
     }
     loadInputs();
@@ -418,9 +502,48 @@ SystolicAccel::startLayer()
         status = 4 | 2;     // error + done
         return;
     }
-    configure(m, k, n);
-    resetRunState();
+    // A row-major A and C must continue on a cache line at the next M tile.
+    if (mTile && m > mTile && ((mTile * k) % lineSize ||
+                               (mTile * n * 4) % lineSize)) {
+        warn("SystolicAccel: m_tile=%d does not keep A and C line-aligned "
+             "for K=%d N_out=%d", mTile, k, n);
+        status = 4 | 2;     // error + done
+        return;
+    }
+    if (nTile && (nTile % N || nTile % 16 || n % 16 || (n % nTile) % 16)) {
+        warn("SystolicAccel: n_tile=%d must be a multiple of N and of 16, and "
+             "every slice of N_out=%d a multiple of 16 columns", nTile, n);
+        status = 4 | 2;     // error + done
+        return;
+    }
+    layerM = m;
+    layerNout = n;
+    nColsDone = 0;
+    wDramLayerBase = wDramBase;
+    mRowsDone = 0;
+    computeCyclesTotal = 0;
+    verifyBaseline = stats.verifyMismatches.value();
+    layerCycles = 0;
     stats.layers++;
+    beginMTile(mTile ? std::min<uint64_t>(mTile, m) : m);
+    inform("SystolicAccel: layer %d start: GEMM %dx%dx%d, %d tiles, "
+           "T=%d, A@%#x W@%#x C@%#x", (uint64_t)stats.layers.value(),
+           M, K, Nout, nTiles, T, aDramBase, wDramBase, cDramBase);
+    if (!tickEvent.scheduled())
+        schedule(tickEvent, clockEdge());
+}
+
+void
+SystolicAccel::beginMTile(uint64_t rows, bool load_a)
+{
+    const uint64_t layer_cycles = layerCycles;
+    configure(rows, regs[RegK / 8],
+              nTile ? std::min(nTile, layerNout - nColsDone) : layerNout);
+    resetRunState();
+    layerCycles = layer_cycles;
+    if (load_a)
+        stats.mTiles++;
+    stats.nSlices++;
 
     // The ideal-memory baselines read operands without timing, so take a
     // functional copy of what the host put in DRAM.
@@ -436,6 +559,12 @@ SystolicAccel::startLayer()
                            std::min(chunk, wPacked.size() - o));
     }
 
+    if (!load_a) {
+        // The next slice of output columns over the A already in the SPM.
+        phase = Phase::Compute;
+        phaseCycles = 0;
+        return;
+    }
     aLines = ceilDiv(M * K, lineSize);
     // Zero the padded columns of the last K-block (K not a multiple of
     // N): the SPM may still hold the previous layer's data there.
@@ -452,11 +581,23 @@ SystolicAccel::startLayer()
         }
     }
     phase = Phase::LoadA;
-    inform("SystolicAccel: layer %d start: GEMM %dx%dx%d, %d tiles, "
-           "T=%d, A@%#x W@%#x C@%#x", (uint64_t)stats.layers.value(),
-           M, K, Nout, nTiles, T, aDramBase, wDramBase, cDramBase);
-    if (!tickEvent.scheduled())
-        schedule(tickEvent, clockEdge());
+}
+
+void
+SystolicAccel::loadPrepackedWeights()
+{
+    const auto &p = params();
+    if (p.w_prepacked_file.empty())
+        return;
+    std::ifstream f(p.w_prepacked_file, std::ios::binary);
+    fatal_if(!f, "SystolicAccel: cannot open '%s'", p.w_prepacked_file);
+    std::vector<char> line(lineSize);
+    for (Addr a = p.w_prepacked_addr;; a += lineSize) {
+        f.read(line.data(), lineSize);
+        if (f.gcount() == 0)
+            break;
+        functionalWrite(dramPort, a, line.data(), f.gcount());
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -631,36 +772,54 @@ SystolicAccel::tick()
         }
         break;
 
-      case Phase::Compute:
+      case Phase::Compute: {
         if (sched < schedEnd) {
             dmaAdvance();
             generateReads();
         }
         for (auto &l : lanes)
             l->trySend();
+        const uint64_t step = sched;
+        const bool steady = inSteadyState();
+        bool stalled = false;
+        if (steady)
+            stats.steadyStateCycles++;
+        else
+            stats.fillDrainCycles++;
         if (sched < schedEnd) {
             bool dma_blocked = false;
             if (tryExecute(dma_blocked)) {
                 stats.activeCycles++;
+                lastStall = StallCause::None;
+                if (steady && decode(step).actTile >= 0)
+                    stats.steadyStateRows++;
             } else {
+                stalled = true;
                 stats.stallCycles++;
-                if (dma_blocked)
+                if (dma_blocked) {
                     stats.dmaStallCycles++;
-                else
+                    lastStall = StallCause::Dma;
+                } else {
                     stats.spmStallCycles++;
+                }
             }
         } else {
             stats.drainCycles++;
+            lastStall = StallCause::Drain;
         }
+        if (traceOut)
+            writeTraceRow(step, stalled);
         cyclesElapsed++;
 
         if (sched >= schedEnd && drained()) {
             stats.totalCycles += cyclesElapsed;
             stats.scheduleCycles += schedEnd;
             stats.realMacs += double(M) * K * Nout;
-            stats.modelDemand = double(5 * N * M + N * N) /
-                                double(std::max<uint64_t>(M, N));
-            regs[RegComputeCycles / 8] = cyclesElapsed;
+            if (mRowsDone == 0)
+                stats.modelDemand = double(5 * N * M + N * N) /
+                                    double(std::max<uint64_t>(M, N));
+            computeCyclesTotal += cyclesElapsed;
+            regs[RegComputeCycles / 8] = computeCyclesTotal;
             if (hostDriven) {
                 if (idealSpm) {
                     // No timing psum writes happened; put C in the SPM
@@ -685,6 +844,7 @@ SystolicAccel::tick()
             return;
         }
         break;
+      }
 
       case Phase::StoreC:
         cStoreAdvance();
@@ -693,8 +853,27 @@ SystolicAccel::tick()
         stats.storeCycles++;
         if (cChunksIssued == cChunks && cInFlight.empty() &&
             cDramPending == 0 && !dramPort.busy()) {
-            layerDone(true);
-            return;
+            if (mRowsDone + M >= layerM && nColsDone + Nout >= layerNout) {
+                layerDone(true);
+                return;
+            }
+            if (verify)
+                doVerify();
+            if (nColsDone + Nout < layerNout) {
+                // Next output slice: same A, the tiles of the next columns.
+                wDramBase += ceilDiv(Nout, N) * nKb * N * N;
+                nColsDone += Nout;
+                beginMTile(M, false);
+            } else {
+                // Next M tile: row-major A and C continue where this one
+                // ended, and the weights start over.
+                mRowsDone += M;
+                aDramBase += M * K;
+                cDramBase += M * layerNout * 4;
+                wDramBase = wDramLayerBase;
+                nColsDone = 0;
+                beginMTile(std::min<uint64_t>(mTile, layerM - mRowsDone));
+            }
         }
         break;
 
@@ -737,7 +916,7 @@ SystolicAccel::cStoreAdvance()
         const uint64_t m = e / Nout, n = e % Nout;
         const Addr a = cBase + (((n / N) * M + m) * N + n % N) * 4;
         auto *st = new AccessState(Stream::CStoreRead, c, p, curTick());
-        dmaQ(dmaLaneRR++, a).push(spmRead(a, st), true);
+        dmaReadQ(dmaLaneRR++, a).push(spmRead(a, st), true);
     }
 }
 
@@ -750,7 +929,10 @@ SystolicAccel::dmaAdvance()
         const uint64_t t = dmaIssueTile;
         const unsigned slot = t % weightSlots;
         if (idealDram) {
-            if (!idealSpm) {
+            if (weightStore == WeightStore::Separate) {
+                std::memcpy(&wStage[uint64_t(slot) * N * N],
+                            &wPacked[t * N * N], N * N);
+            } else if (!idealSpm) {
                 Addr base = wRowAddr(t, 0);
                 for (unsigned off = 0; off < N * N; off += 8)
                     spmFunctionalWrite(base + off,
@@ -784,7 +966,13 @@ SystolicAccel::dmaAdvance()
 void
 SystolicAccel::generateReads()
 {
-    while (genCycle < schedEnd && genCycle < sched + lookahead) {
+    // Lockstep: the next step waits until the banks took all of this one.
+    // A step's partial sums come from rows at least N + 1 steps older, which
+    // have executed as long as issue stays within N + 1 steps of the array.
+    if (lockstep && (stepReadsUnsent || stepWritesUnsent))
+        return;
+    const uint64_t depth = lockstep ? std::min(lookahead, N + 1) : lookahead;
+    while (genCycle < schedEnd && genCycle < sched + depth) {
         const CycleInfo ci = decode(genCycle);
         // Weight reads for a tile can only start once its DMA landed.
         if (ci.wTile >= 0 && !dmaDone[ci.wTile])
@@ -810,6 +998,8 @@ SystolicAccel::generateReads()
                     actQ(j, base + 8 * j).push(
                         spmRead(base + 8 * j, st), true);
                     s.pending++;
+                    if (lockstep)
+                        stepReadsUnsent++;
                 }
             }
         }
@@ -818,6 +1008,11 @@ SystolicAccel::generateReads()
             if (idealSpm) {
                 std::memcpy(s.wgt.data(),
                             &wPacked[(ci.wTile * N + ci.r) * N], N);
+            } else if (weightStore == WeightStore::Separate) {
+                // The staging buffer has its own port: no bank traffic.
+                std::memcpy(s.wgt.data(),
+                            &wStage[((ci.wTile % weightSlots) * N + ci.r) * N],
+                            N);
             } else {
                 Addr base = wRowAddr(ci.wTile, ci.r);
                 for (unsigned j = 0; j < wgtLanes; ++j) {
@@ -826,8 +1021,38 @@ SystolicAccel::generateReads()
                     wgtQ(j, base + 8 * j).push(
                         spmRead(base + 8 * j, st), true);
                     s.pending++;
+                    if (lockstep)
+                        stepReadsUnsent++;
                 }
             }
+        }
+        if (psumRmw && !idealSpm) {
+            // Accumulating across K tiles: the partial sum leaving a lane in
+            // this step must be added to the stored one, so that word is one
+            // more read the step needs.  A row's first K tile has nothing to
+            // read.  The read data itself is not used here: the array model
+            // keeps the running sum, and verification checks the result.
+            for (unsigned j = 0; j < psumLanes; ++j) {
+                const uint64_t lag = N + 2 * j + 1;
+                if (genCycle < lag)
+                    break;
+                const CycleInfo pi = decode(genCycle - lag);
+                if (pi.actTile < 0 || uint64_t(pi.actTile) % nKb == 0)
+                    continue;
+                const Addr a = cRowAddr(pi.actTile, pi.m) + 8 * j;
+                auto *st = new AccessState(Stream::PsumRead, genCycle, j,
+                                           curTick());
+                psumReadQ(j, a).push(spmRead(a, st), true);
+                s.pending++;
+                stats.psumReadBytes += 8;
+                if (lockstep)
+                    stepReadsUnsent++;
+            }
+        }
+        if (lockstep) {
+            sendPsums(genCycle);
+            genCycle++;
+            break;
         }
         genCycle++;
     }
@@ -838,6 +1063,35 @@ SystolicAccel::tryExecute(bool &dma_blocked)
 {
     const uint64_t c = sched;
     const Slot &s = slots[c % lookahead];
+    if (lockstep) {
+        // The step is frozen until the banks took all of its words and its
+        // read data is back.  Its reads are charged first: a stall with no
+        // read left to serve can only be partial sums.
+        const bool issued = s.cycle == c;
+        if (!issued && !stepReadsUnsent && !stepWritesUnsent) {
+            dma_blocked = true;
+            return false;
+        }
+        const bool newest = c + 1 == genCycle || !issued;
+        if (stepReadsUnsent && newest) {
+            stats.spmReadStallCycles++;
+            lastStall = StallCause::Read;
+            return false;
+        }
+        if (stepWritesUnsent && newest) {
+            stats.spmWriteStallCycles++;
+            lastStall = StallCause::Write;
+            return false;
+        }
+        if (s.pending) {
+            stats.spmReadStallCycles++;
+            lastStall = StallCause::Read;
+            return false;
+        }
+        execute(c);
+        sched++;
+        return true;
+    }
     if (s.cycle != c) {
         // Reads for this cycle could not even be issued: the weight tile
         // it needs has not arrived from DRAM yet.
@@ -847,6 +1101,7 @@ SystolicAccel::tryExecute(bool &dma_blocked)
     }
     if (s.pending) {
         stats.spmReadStallCycles++;
+        lastStall = StallCause::Read;
         DPRINTF(SystolicAccel, "cycle %d: stall (%d reads pending)\n", c,
                 s.pending);
         return false;
@@ -867,6 +1122,7 @@ SystolicAccel::tryExecute(bool &dma_blocked)
             if (!perBank && psumQ(j, spmBase).queue.size() >=
                                 psumQueueDepth) {
                 stats.spmWriteStallCycles++;
+                lastStall = StallCause::Write;
                 DPRINTF(SystolicAccel, "cycle %d: stall (psum lane %d "
                         "full)\n", c, j);
                 return false;
@@ -875,6 +1131,7 @@ SystolicAccel::tryExecute(bool &dma_blocked)
         if (perBank &&
             outstandingWrites + due > uint64_t(psumQueueDepth) * psumLanes) {
             stats.spmWriteStallCycles++;
+            lastStall = StallCause::Write;
             DPRINTF(SystolicAccel, "cycle %d: stall (write buffer full, "
                     "%d outstanding)\n", c, outstandingWrites);
             return false;
@@ -921,6 +1178,13 @@ SystolicAccel::execute(uint64_t c)
                 ci.actTile, ci.m);
     }
 
+    if (!lockstep)
+        sendPsums(c);
+}
+
+void
+SystolicAccel::sendPsums(uint64_t c)
+{
     // Partial sums leave the bottom edge, skewed one column per cycle;
     // lane j carries columns 2j and 2j+1 (one 8-byte bank word).
     for (unsigned j = 0; j < psumLanes; ++j) {
@@ -931,13 +1195,50 @@ SystolicAccel::execute(uint64_t c)
         if (pr.cycle != c - lag)
             continue;
         stats.psumBytes += 8;
-        if (!idealSpm) {
+        if (psumExternal) {
+            // No bank port: it reaches the C region without timing.
+            spmFunctionalWrite(pr.addr + 8 * j, &pr.vals[2 * j]);
+        } else if (!idealSpm) {
             auto *st = new AccessState(Stream::Psum, c, j, curTick());
             psumQ(j, pr.addr + 8 * j).push(
                 spmWrite(pr.addr + 8 * j, &pr.vals[2 * j], st), false);
             outstandingWrites++;
+            if (lockstep)
+                stepWritesUnsent++;
         }
     }
+}
+
+void
+SystolicAccel::writeTraceHeader()
+{
+    *traceOut << "cycle,sched_step,stalled,stall_cause";
+    for (unsigned b = 0; b < spmBanks; ++b)
+        *traceOut << ",bank" << b << "_op,bank" << b << "_addr";
+    *traceOut << "\n";
+}
+
+void
+SystolicAccel::writeTraceRow(uint64_t step, bool stalled)
+{
+    static const char *const causes[] = {"none", "read", "write", "dma",
+                                         "drain"};
+    *traceOut << traceCycle++ << ',' << step << ',' << int(stalled) << ','
+              << causes[int(stalled || lastStall == StallCause::Drain
+                            ? lastStall : StallCause::None)];
+    for (auto &op : traceOps) {
+        if (op.read && op.write) {
+            *traceOut << ",RW," << op.readRow << '/' << op.writeRow;
+        } else if (op.read) {
+            *traceOut << ",R," << op.readRow;
+        } else if (op.write) {
+            *traceOut << ",W," << op.writeRow;
+        } else {
+            *traceOut << ",idle,";
+        }
+        op = TraceOp();
+    }
+    *traceOut << '\n';
 }
 
 bool
@@ -982,6 +1283,14 @@ SystolicAccel::recvSpmResp(PacketPtr pkt)
         stats.spmReadLatency.sample(lat);
         break;
       }
+      case Stream::PsumRead: {
+        Slot &s = slots[st->id % lookahead];
+        panic_if(s.cycle != st->id, "Psum read for cycle %d but slot holds "
+                 "cycle %d", st->id, s.cycle);
+        assert(s.pending);
+        s.pending--;
+        break;
+      }
       case Stream::Psum:
         assert(outstandingWrites);
         outstandingWrites--;
@@ -1012,7 +1321,7 @@ SystolicAccel::recvSpmResp(PacketPtr pkt)
             auto *ws = new AccessState(Stream::CStoreWrite, st->id, 0,
                                        curTick());
             auto req = std::make_shared<Request>(
-                cDramBase + st->id * lineSize, lineSize, 0, requestorId);
+                cLineAddr(st->id), lineSize, 0, requestorId);
             PacketPtr wp = new Packet(req, MemCmd::WriteLineReq);
             wp->allocate();
             wp->setData(ch.data.data());
@@ -1070,6 +1379,19 @@ SystolicAccel::recvDramResp(PacketPtr pkt)
         if (idealSpm) {
             if (--dmaLinesLeft[slot] == 0)
                 dmaTileLanded(t);
+        } else if (weightStore != WeightStore::Spm) {
+            // The line reaches its weight slot without crossing the banks.
+            const uint8_t *data = pkt->getConstPtr<uint8_t>();
+            if (weightStore == WeightStore::Separate) {
+                std::memcpy(&wStage[uint64_t(slot) * N * N +
+                                    st->word * lineSize], data, lineSize);
+            } else {
+                const Addr base = wRowAddr(t, 0) + st->word * lineSize;
+                for (unsigned w = 0; w < lineSize / 8; ++w)
+                    spmFunctionalWrite(base + 8 * w, data + 8 * w);
+            }
+            if (--dmaLinesLeft[slot] == 0)
+                dmaTileLanded(t);
         } else {
             // Split the 64-byte line into bank words.
             const Addr base = wRowAddr(t, 0) + st->word * lineSize;
@@ -1090,6 +1412,17 @@ SystolicAccel::recvDramResp(PacketPtr pkt)
     return true;
 }
 
+Addr
+SystolicAccel::cLineAddr(uint64_t chunk) const
+{
+    if (!nTile)
+        return cDramBase + chunk * lineSize;
+    // A slice of each row: C in DRAM stays row-major over all the columns.
+    const uint64_t per_row = Nout * 4 / lineSize;
+    return cDramBase + (chunk / per_row) * layerNout * 4 + nColsDone * 4 +
+           (chunk % per_row) * lineSize;
+}
+
 void
 SystolicAccel::dmaTileLanded(uint64_t tile)
 {
@@ -1108,11 +1441,12 @@ SystolicAccel::layerDone(bool complete)
     const bool checked = verify && complete;
     uint64_t bad = 0;
     if (checked) {
-        const double before = stats.verifyMismatches.value();
         doVerify();
-        bad = stats.verifyMismatches.value() - before;
+        bad = stats.verifyMismatches.value() - verifyBaseline;
     }
     regs[RegVerify / 8] = bad;
+    if (traceOut)
+        traceOut->flush();
     phase = Phase::Done;
     status = 2 | (bad ? 4 : 0);     // done (+ error)
 
@@ -1133,7 +1467,8 @@ SystolicAccel::layerDone(bool complete)
 void
 SystolicAccel::doVerify()
 {
-    // Operands: the files (standalone) or what the host put in DRAM.
+    // Operands: the files (standalone) or what the host put in DRAM.  With
+    // M tiling this checks the current M tile.
     std::vector<int8_t> a_mat, w_packed;
     if (hostDriven) {
         a_mat.resize(M * K);
@@ -1193,9 +1528,11 @@ SystolicAccel::doVerify()
         dram_c.resize(M * Nout);
         const size_t bytes = dram_c.size() * 4, chunk = lineSize;
         auto *dst = reinterpret_cast<uint8_t *>(dram_c.data());
-        for (size_t o = 0; o < bytes; o += chunk)
-            functionalRead(dramPort, cDramBase + o, dst + o,
+        for (size_t o = 0; o < bytes; o += chunk) {
+            const Addr a = nTile ? cLineAddr(o / chunk) : cDramBase + o;
+            functionalRead(dramPort, a, dst + o,
                            std::min(chunk, bytes - o));
+        }
     }
 
     std::vector<int32_t> spm_row(N);
@@ -1258,6 +1595,23 @@ SystolicAccel::AccelStats::AccelStats(SystolicAccel &a)
                "Stalls waiting for a weight tile to arrive from DRAM"),
       ADD_STAT(drainCycles, statistics::units::Cycle::get(),
                "Cycles after the schedule waiting for write acks"),
+      ADD_STAT(fillDrainCycles, statistics::units::Cycle::get(),
+               "Compute cycles outside the steady-state window (array "
+               "filling, draining, write acks)"),
+      ADD_STAT(steadyStateCycles, statistics::units::Cycle::get(),
+               "Compute cycles from the first row's last partial sum to the "
+               "last row entering the array"),
+      ADD_STAT(steadyStateRows, statistics::units::Count::get(),
+               "Activation rows that entered in the steady-state window"),
+      ADD_STAT(steadyStateUtilization, statistics::units::Ratio::get(),
+               "steadyStateRows / steadyStateCycles (NaN if a layer is too "
+               "short to have a steady state)"),
+      ADD_STAT(mTiles, statistics::units::Count::get(),
+               "M tiles processed (one per layer without M tiling)"),
+      ADD_STAT(nSlices, statistics::units::Count::get(),
+               "M tile x N_out slice pairs processed (one without tiling)"),
+      ADD_STAT(psumReadBytes, statistics::units::Byte::get(),
+               "Old partial-sum bytes read back (psum_rmw)"),
       ADD_STAT(loadCycles, statistics::units::Cycle::get(),
                "Host-driven: cycles loading A from DRAM into the SPM"),
       ADD_STAT(storeCycles, statistics::units::Cycle::get(),
@@ -1333,6 +1687,7 @@ SystolicAccel::AccelStats::AccelStats(SystolicAccel &a)
 {
     const double pes = double(a.N) * a.N;
     peUtilization = usefulRows / totalCycles;
+    steadyStateUtilization = steadyStateRows / steadyStateCycles;
     macUtilization = realMacs / (totalCycles * statistics::constant(pes));
     idealUtilization = usefulRows / scheduleCycles;
     layerUtilization = usefulRows / layerCycles;

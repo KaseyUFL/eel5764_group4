@@ -17,7 +17,9 @@ It contains:
 * a cycle-level gem5 model of the array (`SystolicAccel`);
 * a RISC-V host system that drives it;
 * the workload generator;
-* the definitions of the 772 simulations behind the results;
+* the definitions of the 3,573 simulations behind the results: 772 of the
+  default model, and the rest for the options that are off by default and the
+  RTL's configuration;
 * the scripts that turn those simulations into data, figures and tables.
 
 The generated results (CSV data, figures, tables) are not kept in git. The
@@ -34,11 +36,14 @@ What the flow produces, in `results/`:
 * `data/`: one CSV per experiment suite (one row per simulation, every
   metric of the proposal's Table II) and `key_results.json` (every
   headline number).
-* `figures/`: 21 figures, such as the saturation curves (PE utilization vs
+* `figures/`: 26 figures, such as the saturation curves (PE utilization vs
   N per bank count), the knee bank by bank, the bank-matching rule, and
   low reuse vs DRAM. Each comes as PNG and PDF.
-* `tables/`: 19 tables, from the proposal's Tables I and II to the
-  saturation points, as Markdown and CSV.
+* `tables/`: 42 tables, from the proposal's Tables I and II to the
+  saturation points, as Markdown and CSV, plus the two hypothesis verdicts
+  (`hypotheses.md`, `hypotheses_rtl_config.md`).
+* `paper/<source>/`: the paper's 11 figures and their tables, from
+  `make paper-figures` (source `rtlcfg` by default, or `baseline`).
 
 `analysis/README.txt` describes each one.
 
@@ -76,12 +81,16 @@ What the flow produces, in `results/`:
 
 **[analysis/](analysis/)**, the experiments and the analysis:
 
-* `experiments.py` defines the 18 experiment suites (772 simulations).
+* `experiments.py` defines the 53 experiment suites (3,573 simulations).
 * `collect.py` runs them in parallel.
 * `parse_stats.py` turns gem5's `stats.txt` into one CSV row.
 * `model.py` is the analytical model (eq. 1–2).
 * `plot_curves.py` and `style.py` draw the figures and tables.
 * `compare_results.py` compares two sets of results number by number.
+* `regress.sh` reruns 12 points of the default model and diffs them against
+  `golden_stats.csv`, exactly. Run it after every model change.
+* `trace_diff.py` finds the first cycle where two per-cycle bank traces
+  disagree, for example gem5 and the RTL.
 * `templates/` holds the formats for the RTL cycle counts and Vivado
   numbers, which feed two of the figures once they exist.
 * `README.txt` describes every suite, figure and table.
@@ -325,13 +334,12 @@ make run WL=bert_ffn1 N=16 BANKS=8 ARGS='--mode sw'     # software baseline
 ### 10. All experiments
 
 ```bash
-make list         # the 18 suites and how many runs each has
-make data         # all 772 simulations -> results/data/<suite>.csv
+make list         # the 53 suites and how many runs each has
+make data         # all 3,573 simulations -> results/data/<suite>.csv
 make data RESULTS_DIR=~/project-docs/results   # write somewhere else
 ```
 
-* `make data` takes about an hour on 24 threads, and most of that is one
-  long software baseline. It runs 12 simulations at a time (`SIM_JOBS`).
+* `make data` takes about two hours on 24 threads. It runs 12 simulations at a time (`SIM_JOBS`).
 * Finished runs are kept in `build/runs/`. If Windows sleeps or WSL
   restarts, run `make data` again and it continues where it stopped.
 * To run only some suites, use `make data SUITES="main knee"`.
@@ -365,7 +373,7 @@ for example the copy that went into the project documents. Set
 
 To do steps 4b to 11 in one go after the setup, run `make all`. It
 starts with `make deps` and stops there if anything is missing; a full run
-from scratch takes about 1.5 hours. An existing gem5 build is reused.
+from scratch takes about 2.5 hours. An existing gem5 build is reused.
 
 ## Make targets
 
@@ -385,8 +393,11 @@ from scratch takes about 1.5 hours. An existing gem5 build is reused.
 | `make list` | the experiment suites and their sizes |
 | `make data [SUITES=…] [FORCE=1]` | run the experiments into `results/data/` |
 | `make figures [PLOTS=…]` | redraw figures and tables from `results/data/` |
+| `make paper-figures [PAPER_SOURCE=baseline]` | the paper's figures, from the RTL's configuration by default, into `results/paper/<source>/` |
 | `make model` | the analytical model's predictions (Table I) |
 | `make check REF=dir` | compare `results/` with a reference results folder |
+| `make regress` | rerun 12 points of the default model and diff them against `analysis/golden_stats.csv`, exactly (about 1 min) |
+| `make prepacked` | packed weights for `--prepacked-weights` (`make data` does this itself) |
 | `make clean` | delete `build/` (raw runs) |
 | `make distclean` | also delete `results/`, workloads, host program, `.venv` and `third_party/` |
 
@@ -399,6 +410,37 @@ from scratch takes about 1.5 hours. An existing gem5 build is reused.
 | `RISCV_CC` | first one found | RISC-V compiler command |
 | `SIM_JOBS` | 12 | simulations in parallel for `make data` |
 | `BUILD_JOBS` | nproc − 2 | compile jobs for `make gem5` |
+
+## Model options
+
+The default model is the one behind the published results, and
+`make regress` keeps it that way. Everything else is an option of
+`systolic_se.py`, off by default, and has its own suite:
+
+| Option | What it models | Suite |
+| :--- | :--- | :--- |
+| `--stall-model lockstep` | the literal global stall, no queues between banks and array | `lockstep`, `lockcheck`, `rtlval_lockstep` |
+| `--bank-ports 1r1w` | simple-dual-port BRAM banks | `bankports` |
+| `--weight-store fill_bypass\|separate` | a weight tile crossing the banks once, or not at all | `weightstore` |
+| `--bank-hash xor` | a skew hash against partial-sum lane aliasing | `bankhash` |
+| `--spm-depth`, `--m-tile` | 512-word BRAM depth and tiling A along M | `mtile` |
+| `--bank-trace` | a per-cycle bank trace for debugging against the RTL | |
+| `--split-host-stats` | host CPI/IPC without the polling loop | `hostext` |
+| `--prepacked-weights` | weights already in DRAM, so the simulation skips packing them | `hostext` |
+| `--membus-width` | a wider memory bus, for DDR5-8400 | `dramwide` |
+| `--n-tile` | tiling the output columns as well as M | `rtlcfg_ntile`, `ntile` |
+| `--psum-rmw` | accumulation reading the old partial sum back through the read port | `rtlcfg_rmw_*` |
+| `--psum-store external` | partial sums outside the counted banks | `psumopts` |
+
+[gem5_model/README.txt](gem5_model/README.txt) section 6.8 describes each one
+and section 7 lists the frozen statistic names. Array sizes must stay
+multiples of 8; section 6.9 says why.
+
+The `rtlcfg_*` suites rerun every hypothesis experiment with the options that
+match the RTL, `--bank-ports 1r1w --weight-store fill_bypass`. Section 6.10
+says how those were read from `rtl/src`, and which parts of the RTL do not
+match the model yet. `results/tables/hypotheses_rtl_config.md` is the automatic
+H1/H2/H3 check for that configuration.
 
 ## Reproducibility
 
@@ -413,8 +455,11 @@ this folder is installed:
 
 This was checked on 2026-10-25 by running everything twice, in a fresh
 clone and in a second copy at a different path. Both times gem5 was built
-from scratch and all 772 runs were repeated. Every result file came out
-byte-identical. So did the workload files and the host binary.
+from scratch and all 772 runs of the default model were repeated. Every
+result file came out byte-identical. So did the workload files and the host
+binary. When the options that are off by default were added, a rerun of those
+772 runs again matched exactly (`make check`, on 2026-11-01), and the default
+host binary stayed byte-identical.
 
 The results depend on:
 

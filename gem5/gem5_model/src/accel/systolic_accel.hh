@@ -1,6 +1,13 @@
+//---------------------------------------------------------------------------//
+// EEL5764 Computer Architecture                                             //
+//---------------------------------------------------------------------------//
+// Project     : Parameterized SRAM Scratchpad Array                         //
+// Filename    : systolic_accel.hh                                           //
+// Engineers   : Evan Espino-DeJesus, Tyla Hart, Kasey Hill and James Woelke //
+// Group       : #4                                                          //
+// Description : SystolicAccel class declaration                             //
+//---------------------------------------------------------------------------//
 /*
- * EEL5764 (Fall 2026) Group 4 -- SystolicAccel.
- *
  * Timing + functional model of a weight-stationary INT8 N x N systolic
  * array fed by a banked scratchpad (SPM).  See SystolicAccel.py for the
  * port layout and gem5_model/README.txt for the schedule.
@@ -20,6 +27,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <string>
@@ -69,12 +77,19 @@ class SystolicAccel : public ClockedObject
     enum class Stream : uint8_t
     {
         Act, Weight, Psum,      // array traffic (SPM)
+        PsumRead,               // old partial sum read back (psum_rmw)
         Dma, DramRead,          // weight refill: SPM write / DRAM read
         ALoad, ALoadRead,       // A load:  SPM write / DRAM read
         CStoreRead, CStoreWrite // C store: SPM read / DRAM write
     };
 
     enum class Phase : uint8_t { Idle, LoadA, Compute, StoreC, Done };
+
+    /** How many times a weight tile crosses the banks (see weight_store). */
+    enum class WeightStore : uint8_t { Spm, FillBypass, Separate };
+
+    /** What one compute-phase cycle was spent on (bank trace). */
+    enum class StallCause : uint8_t { None, Read, Write, Dma, Drain };
 
     /** Carried on every timing packet so the response can be routed. */
     struct AccessState : public Packet::SenderState
@@ -85,6 +100,7 @@ class SystolicAccel : public ClockedObject
         Tick created;     // when the access was generated (AMAT start)
         Tick sent = 0;    // when the crossbar accepted it
         int bank = -1;    // SPM bank (for the per-bank statistics)
+        uint64_t row = 0; // word address inside the bank (bank trace)
         AccessState(Stream s, uint64_t i, unsigned w, Tick c)
             : stream(s), id(i), word(w), created(c) {}
     };
@@ -192,9 +208,14 @@ class SystolicAccel : public ClockedObject
     const unsigned dmaMaxOutstanding;
     const unsigned spmBanks;
     const bool perBank, moduloBanks, readsFirst;
+    const bool lockstep, sdpPorts, xorHash;
+    const WeightStore weightStore;
+    const unsigned hashShift;
+    const uint64_t mTile, nTile;
+    const bool psumRmw, psumExternal;
     const bool idealSpm, idealDram, verify, hostDriven;
     const uint64_t maxCycles;
-    const Addr spmBase, spmSize, bankBytes;
+    const Addr spmBase, spmSize, bankBytes, readAlias;
     const Addr pioAddr, pioSize;
     const Cycles pioLatency;
     static constexpr unsigned lineSize = 64;
@@ -251,10 +272,43 @@ class SystolicAccel : public ClockedObject
     uint64_t cChunks = 0, cChunksIssued = 0, cDramPending = 0;
     std::map<uint64_t, CChunk> cInFlight;
 
+    // Lockstep: words of the newest step not yet accepted by their bank
+    uint64_t stepReadsUnsent = 0, stepWritesUnsent = 0;
+
+    // Steady-state window of the schedule, [ssStart, ssEnd]: the first
+    // row's last partial sum has left, and the last row has not yet entered
+    uint64_t ssStart = 0, ssEnd = 0;
+
+    // M tiling: the layer as the host programmed it, and how far it got
+    uint64_t layerM = 0, mRowsDone = 0;
+    // N_out slices: the layer's columns, how many are done, and where the
+    // layer's packed weights start (the slice's own tiles come later)
+    uint64_t layerNout = 0, nColsDone = 0;
+    Addr wDramLayerBase = 0;
+    uint64_t computeCyclesTotal = 0;
+    double verifyBaseline = 0;
+
+    // Separate weight buffer (weight_store = separate)
+    std::vector<int8_t> wStage;
+
+    // Bank trace: this cycle's accepted accesses, per bank
+    struct TraceOp
+    {
+        bool read = false, write = false;
+        uint64_t readRow = 0, writeRow = 0;
+    };
+    std::unique_ptr<std::ofstream> traceOut;
+    std::vector<TraceOp> traceOps;
+    uint64_t traceCycle = 0;
+    StallCause lastStall = StallCause::None;
+
     // ---------------------------------------------------------------
     void configure(uint64_t m, uint64_t k, uint64_t n);
     void resetRunState();
     void startLayer();
+    void beginMTile(uint64_t rows, bool load_a = true);
+    Addr cLineAddr(uint64_t chunk) const;
+    void loadPrepackedWeights();
     void layerDone(bool complete);
     Tick pioAccess(PacketPtr pkt);
 
@@ -265,7 +319,16 @@ class SystolicAccel : public ClockedObject
 
     /** Bank of a (logical) SPM address: 8-byte words, word mod BANKS. */
     unsigned bankOf(Addr a) const
-    { return ((a - spmBase) >> 3) % spmBanks; }
+    {
+        const uint64_t w = (a - spmBase) >> 3;
+        if (!xorHash)
+            return w % spmBanks;
+        // Skew hash: rotate each row of BANKS words by a hash of the row
+        // number.  A row still has one word per bank, so (bank, row) stays
+        // a one-to-one map for any BANKS.
+        const uint64_t r = w / spmBanks;
+        return (w % spmBanks + (r ^ (r >> hashShift))) % spmBanks;
+    }
     /**
      * Physical address of a logical SPM address.  With power-of-two
      * BANKS the crossbar's address interleaving does the banking and the
@@ -278,20 +341,30 @@ class SystolicAccel : public ClockedObject
         if (!moduloBanks)
             return a;
         const uint64_t w = (a - spmBase) >> 3;
-        return spmBase + (w % spmBanks) * bankBytes +
+        return spmBase + bankOf(a) * bankBytes +
                (w / spmBanks) * 8 + (a & 7);
     }
     // Request queue for each stream.  In "bank" arbitration there is one
-    // queue per bank and the address picks it; in "lane" arbitration each
+    // queue per bank and the address picks it (with bank_ports = 1r1w, one
+    // read queue and one write queue per bank); in "lane" arbitration each
     // edge lane has its own queue.
+    LanePort &bankWriteQ(Addr a)
+    { return *lanes[bankOf(a) + (sdpPorts ? spmBanks : 0)]; }
     LanePort &actQ(unsigned j, Addr a)
     { return perBank ? *lanes[bankOf(a)] : *lanes[j]; }
     LanePort &wgtQ(unsigned j, Addr a)
     { return perBank ? *lanes[bankOf(a)] : *lanes[actLanes + j]; }
     LanePort &psumQ(unsigned j, Addr a)
-    { return perBank ? *lanes[bankOf(a)]
+    { return perBank ? bankWriteQ(a)
                      : *lanes[actLanes + wgtLanes + j]; }
     LanePort &dmaQ(unsigned j, Addr a)
+    { return perBank ? bankWriteQ(a)
+                     : *lanes[actLanes + wgtLanes + psumLanes +
+                              j % dmaLanes]; }
+    LanePort &psumReadQ(unsigned j, Addr a)
+    { return perBank ? *lanes[bankOf(a)]
+                     : *lanes[actLanes + wgtLanes + j]; }
+    LanePort &dmaReadQ(unsigned j, Addr a)
     { return perBank ? *lanes[bankOf(a)]
                      : *lanes[actLanes + wgtLanes + psumLanes +
                               j % dmaLanes]; }
@@ -302,11 +375,18 @@ class SystolicAccel : public ClockedObject
     PacketPtr spmRead(Addr logical, AccessState *st)
     {
         st->bank = bankOf(logical);
-        return makeRead(spmPhys(logical), 8, st);
+        st->row = ((logical - spmBase) >> 3) / spmBanks;
+        return makeRead(spmPhys(logical) + readAlias, 8, st);
     }
     PacketPtr spmWrite(Addr logical, const void *data, AccessState *st)
     {
         st->bank = bankOf(logical);
+        st->row = ((logical - spmBase) >> 3) / spmBanks;
+        // 1r1w: the read-port copy of the bank must end up with the same
+        // data.  Nothing reads a word until its write has been acknowledged,
+        // so updating the copy now is not visible in the timing.
+        if (sdpPorts)
+            functionalWrite(*lanes[0], spmPhys(logical) + readAlias, data, 8);
         return makeWrite(spmPhys(logical), 8, data, st);
     }
 
@@ -317,6 +397,10 @@ class SystolicAccel : public ClockedObject
     void generateReads();
     bool tryExecute(bool &dma_blocked);
     void execute(uint64_t c);
+    void sendPsums(uint64_t c);
+    bool inSteadyState() const { return sched >= ssStart && sched <= ssEnd; }
+    void writeTraceHeader();
+    void writeTraceRow(uint64_t step, bool stalled);
     bool lanesEmpty() const;
     bool drained() const;
     void doVerify();
@@ -331,7 +415,11 @@ class SystolicAccel : public ClockedObject
     void functionalRead(RequestPort &port, Addr addr, void *data,
                         unsigned size);
     void spmFunctionalWrite(Addr logical, const void *data)
-    { functionalWrite(*lanes[0], spmPhys(logical), data, 8); }
+    {
+        functionalWrite(*lanes[0], spmPhys(logical), data, 8);
+        if (sdpPorts)
+            functionalWrite(*lanes[0], spmPhys(logical) + readAlias, data, 8);
+    }
     void spmFunctionalRead(Addr logical, void *data)
     { functionalRead(*lanes[0], spmPhys(logical), data, 8); }
 
@@ -352,6 +440,13 @@ class SystolicAccel : public ClockedObject
         statistics::Scalar spmWriteStallCycles;
         statistics::Scalar dmaStallCycles;
         statistics::Scalar drainCycles;
+        statistics::Scalar fillDrainCycles;
+        statistics::Scalar steadyStateCycles;
+        statistics::Scalar steadyStateRows;
+        statistics::Formula steadyStateUtilization;
+        statistics::Scalar mTiles;
+        statistics::Scalar nSlices;
+        statistics::Scalar psumReadBytes;
         statistics::Scalar loadCycles;
         statistics::Scalar storeCycles;
         statistics::Scalar layerCycles;

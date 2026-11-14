@@ -1,4 +1,12 @@
-# EEL5764 Group 4 -- gem5 system for the SystolicAccel (RISC-V, SE mode).
+#-----------------------------------------------------------------------------#
+# EEL5764 Computer Architecture                                               #
+#-----------------------------------------------------------------------------#
+# Project     : Parameterized SRAM Scratchpad Array                           #
+# Filename    : systolic_se.py                                                #
+# Engineers   : Evan Espino-DeJesus, Tyla Hart, Kasey Hill and James Woelke   #
+# Group       : #4                                                            #
+# Description : gem5 system for the SystolicAccel (RISC-V, SE)                #
+#-----------------------------------------------------------------------------#
 #
 #  Default (host-driven, proposal Sec. IV.A):
 #
@@ -97,6 +105,14 @@ g.add_argument("--cpu-clock", default="2GHz",
                help="Host CPU, caches and memory bus clock")
 g.add_argument("--l1-size", default="32KiB")
 g.add_argument("--l2-size", default="512KiB")
+g.add_argument("--split-host-stats", action="store_true",
+               help="Dump statistics between programming the registers and "
+                    "polling for DONE, so host CPI/IPC cover the setup "
+                    "instead of the polling loop")
+g.add_argument("--prepacked-weights", action="store_true",
+               help="Load the packed weight tiles written by "
+                    "gen_workloads.py --prepack straight into DRAM instead "
+                    "of packing them on the host (shorter simulation)")
 
 g = p.add_argument_group("accelerator / scratchpad")
 g.add_argument("--array-dim", "-N", type=int, default=16,
@@ -115,6 +131,43 @@ g.add_argument("--bank-policy", choices=["fifo", "reads_first"],
                default="fifo",
                help="Order within a bank's request queue: oldest first, or "
                     "reads ahead of queued writes")
+g.add_argument("--stall-model", choices=["decoupled", "lockstep"],
+               default="decoupled",
+               help="decoupled: queues, read-ahead and a write buffer between "
+                    "banks and array; lockstep: every schedule step waits "
+                    "for all its words, the whole array frozen meanwhile")
+g.add_argument("--bank-ports", choices=["1rw", "1r1w"], default="1rw",
+               help="1rw: one 8-byte port per bank; 1r1w: simple dual port, "
+                    "one read and one write port per bank in the same cycle")
+g.add_argument("--weight-store",
+               choices=["spm", "fill_bypass", "separate"], default="spm",
+               help="Bank crossings of a weight tile.  spm: DMA write + array "
+                    "read (2); fill_bypass: array read only (1, eq. 1); "
+                    "separate: staging buffer outside the banks (0)")
+g.add_argument("--bank-hash", choices=["modulo", "xor"], default="modulo",
+               help="Word-to-bank map.  xor: rotate each row of BANKS words "
+                    "by a hash of the row number, against lane aliasing "
+                    "(implies --bank-mapping modulo)")
+g.add_argument("--spm-depth", type=int, default=0,
+               help="Words per bank (BRAM36 in 72-bit mode: 512), 0 = as "
+                    "deep as the layer needs.  A layer that does not fit is "
+                    "refused unless --m-tile is given")
+g.add_argument("--m-tile", default="0",
+               help="Process A in tiles of this many rows, or 'auto' for "
+                    "the largest that fits --spm-depth")
+g.add_argument("--n-tile", default="0",
+               help="Process the output columns in slices of this many (a "
+                    "multiple of N and of 16), or 'auto' for the smallest "
+                    "slice.  A stays in the scratchpad across a slice")
+g.add_argument("--psum-rmw", action="store_true",
+               help="Accumulating across K tiles reads the old partial sum "
+                    "through the bank's read port before writing")
+g.add_argument("--psum-store", choices=["spm", "external"], default="spm",
+               help="spm: partial sums use the bank ports; external: they "
+                    "accumulate outside the counted banks")
+g.add_argument("--bank-trace", default="",
+               help="Write one CSV row per compute-phase cycle to this file "
+                    "(reduced *_rtl layers only)")
 g.add_argument("--no-double-buffer", action="store_true",
                help="Disable shadow weight registers (T = M + N)")
 g.add_argument("--clock", default="2GHz",
@@ -147,6 +200,9 @@ g = p.add_argument_group("memory system")
 g.add_argument("--mem-type", default="DDR4_2400_8x8",
                help="DRAM interface class (DDR4_2400_8x8, LPDDR5_..., ...)")
 g.add_argument("--dram-size", default="1GiB")
+g.add_argument("--membus-width", type=int, default=0,
+               help="Memory bus width in bytes (0 = the SystemXBar default, "
+                    "16: at most 64 B every 2.5 ns, 25.6 GB/s)")
 args = p.parse_args()
 
 N = args.array_dim
@@ -159,9 +215,18 @@ if BANKS < 1:
 pow2 = BANKS & (BANKS - 1) == 0
 mapping = args.bank_mapping
 if mapping == "auto":
-    mapping = "interleave" if pow2 else "modulo"
+    mapping = "interleave" if pow2 and args.bank_hash == "modulo" else "modulo"
 if mapping == "interleave" and not pow2:
     fail("--bank-mapping interleave needs a power-of-two --banks")
+if mapping == "interleave" and args.bank_hash != "modulo":
+    fail("--bank-hash xor needs --bank-mapping modulo")
+if args.stall_model == "lockstep" and args.ideal_spm:
+    fail("--stall-model lockstep needs a real scratchpad, not --ideal-spm")
+host_ext = args.split_host_stats or args.prepacked_weights
+if host_ext and not host:
+    fail("--split-host-stats and --prepacked-weights need the host program")
+if args.prepacked_weights and args.mode != "accel":
+    fail("--prepacked-weights only applies to --mode accel")
 
 # ---------------------------------------------------------------- workload
 if args.gemm:
@@ -185,38 +250,115 @@ else:
 if host and (K % 8 or NOUT % 2):
     fail("host-driven layers need K % 8 == 0 and an even N_out")
 
+if args.bank_trace and not wl["name"].endswith("_rtl"):
+    fail("--bank-trace is limited to the reduced *_rtl layers (traces get "
+         "large: one row per cycle)")
+
 # Weight prefetch depth: a fixed-size staging buffer holds more, smaller
 # tiles at small N.  Deep prefetch is what lets the DMA keep enough DRAM
 # reads in flight (Little's law) and ride out DDR4 refresh (~350 ns).
+capacity = args.spm_depth * BANK_WORD * BANKS  # 0 = as deep as needed
 if args.weight_slots:
     slots = args.weight_slots
 else:
     slots = max(2, int(toMemorySize(args.weight_buffer)) // (N * N))
+    if capacity:
+        # The default buffer would crowd a shallow scratchpad: keep at most
+        # a quarter of it for prefetch.
+        slots = min(slots, max(2, capacity // 4 // (N * N)))
 
 
 def align(x, a):
     return (x + a - 1) // a * a
 
 
+if args.psum_rmw and args.psum_store == "external":
+    fail("--psum-rmw reads through the bank ports; --psum-store external "
+         "does not use them")
+# N_out slices: a whole number of weight tiles, and whole cache lines of C.
+slice_step = N * 16 // math.gcd(N, 16)
+n_tile = slice_step if args.n_tile == "auto" else int(args.n_tile)
+if n_tile and (n_tile % slice_step or NOUT % 16 or (NOUT % n_tile) % 16):
+    fail(f"--n-tile must be a multiple of {slice_step}, and every slice of "
+         f"N_out={NOUT} a multiple of 16 columns")
+if n_tile and not host:
+    fail("--n-tile needs the host program")
+if n_tile and args.c_out:
+    fail("--n-tile and --c-out cannot be combined")
+if n_tile >= NOUT:
+    n_tile = 0
+
 # Scratchpad capacity: blocked A + weight slots + INT32 accumulators, the
 # same layout SystolicAccel computes.  Each bank gets a power-of-two share.
 nkb, nnb = -(-K // N), -(-NOUT // N)
-need = align(align(nkb * M * N, 64) + slots * N * N, 64) + nnb * M * N * 4
-bank_bytes = max(8 * 1024, 1 << math.ceil(math.log2(-(-need // BANKS))))
+nnb_spm = -(-n_tile // N) if n_tile else nnb
+slot_bytes = 0 if args.weight_store == "separate" else slots * N * N
+
+
+def spm_needed(rows):
+    return (align(align(nkb * rows * N, 64) + slot_bytes, 64) +
+            nnb_spm * rows * N * 4)
+
+
+# An M tile must keep row-major A and C on a cache line boundary.
+m_step = 1
+while (m_step * K) % 64 or (m_step * NOUT * 4) % 64:
+    m_step += 1
+
+
+def largest_m_tile():
+    """The largest legal M tile that fits --spm-depth."""
+    rows = ((capacity - slot_bytes) // (nkb * N + nnb_spm * N * 4)
+            // m_step * m_step)
+    while rows >= m_step and spm_needed(rows) > capacity:
+        rows -= m_step
+    if rows < m_step:
+        fail(f"{BANKS} banks x {args.spm_depth} words ({capacity} bytes) "
+             f"cannot hold a {m_step}-row M tile plus {slots} weight slots")
+    return rows
+
+
+if args.m_tile == "auto":
+    if not capacity:
+        fail("--m-tile auto needs --spm-depth")
+    m_tile = largest_m_tile()
+    m_tile = 0 if m_tile >= M else m_tile
+else:
+    m_tile = int(args.m_tile)
+if m_tile and (m_tile % m_step or m_tile < 0):
+    fail(f"--m-tile must be a multiple of {m_step} for this layer")
+if m_tile and not host:
+    fail("--m-tile needs the host program")
+if m_tile and args.c_out:
+    fail("--m-tile and --c-out cannot be combined")
+m_rows = min(m_tile, M) if m_tile else M
+need = spm_needed(m_rows)
+if capacity:
+    if need > capacity:
+        fail(f"layer needs {need} bytes of scratchpad (M tile of {m_rows} "
+             f"rows) but {BANKS} banks x {args.spm_depth} words hold "
+             f"{capacity}; give --m-tile ROWS or --m-tile auto")
+    bank_bytes = args.spm_depth * BANK_WORD
+else:
+    bank_bytes = max(8 * 1024, 1 << math.ceil(math.log2(-(-need // BANKS))))
 spm_size = bank_bytes * BANKS
 
 freq = toFrequency(args.clock)
 dbuf = not args.no_double_buffer
-T = max(M, N) if dbuf else M + N
-d_model = (5 * N * M + N * N) / max(M, N)
+T = max(m_rows, N) if dbuf else m_rows + N
+d_model = (5 * N * m_rows + N * N) / max(m_rows, N)
 print(f"[systolic_se] workload {wl['name']}: M={M} K={K} N_out={NOUT}; "
       f"{'host-driven (RISC-V, mode=' + args.mode + ')' if host else 'standalone'}")
 print(f"[systolic_se] N={N} BANKS={BANKS} (B={BANKS * BANK_WORD} bytes/cycle, "
       f"{mapping}) double_buffer={dbuf} T={T} tiles={nkb * nnb} "
       f"arbitration={args.arbitration} weight_slots={slots}")
 print(f"[systolic_se] eq.(1) D={d_model:.1f} bytes/cycle, "
-      f"predicted util~{min(1.0, BANKS * BANK_WORD / d_model) * M / T:.3f}; "
+      f"predicted util~"
+      f"{min(1.0, BANKS * BANK_WORD / d_model) * m_rows / T:.3f}; "
       f"SPM {spm_size // 1024} KiB")
+print(f"[systolic_se] scratchpad needs {need} bytes "
+      f"(M tile {m_tile or 'off'}, N slice {n_tile or 'off'}, "
+      f"depth {args.spm_depth or 'unlimited'})")
 
 # ------------------------------------------------------------------ system
 system = System()
@@ -239,6 +381,8 @@ shared_size = dram_size - shared_pa
 system.mem_ranges = [AddrRange(shared_pa)] if host else [dram_range]
 
 system.membus = SystemXBar()
+if args.membus_width:
+    system.membus.width = args.membus_width
 system.system_port = system.membus.cpu_side_ports
 mem_cls = getattr(m5.objects, args.mem_type)
 system.mem_ctrl = MemCtrl(dram=mem_cls(range=dram_range))
@@ -280,6 +424,9 @@ if host:
     system.cpu.createInterruptController()
 
     host_bin = os.path.abspath(args.host_bin)
+    if host_ext:
+        # Next to --host-bin, and passed to the program by file name below.
+        host_bin = host_bin + "_ext"
     if not os.path.exists(host_bin):
         fail(f"host program not found: {host_bin}\n"
                  "build it: make host")
@@ -298,7 +445,9 @@ if host:
         cmd=["systolic_host", args.mode,
              os.path.basename(a_file), os.path.basename(w_file),
              os.path.basename(c_file), str(M), str(K), str(NOUT),
-             hex(SHARED_VA), hex(shared_pa), hex(PIO_VA)],
+             hex(SHARED_VA), hex(shared_pa), hex(PIO_VA)]
+        + (["split-stats"] if args.split_host_stats else [])
+        + (["prepacked"] if args.prepacked_weights else []),
     )
     system.workload = SEWorkload.init_compatible(host_bin)
     system.cpu.workload = process
@@ -332,24 +481,41 @@ lat_ns = args.spm_latency / freq * 1e9
 period_ticks = round(1e12 / freq)
 ticks_per_byte = period_ticks // BANK_WORD
 bank_bw = f"{1e12 / ticks_per_byte:.0f}B/s"
-banks = []
 bits = int(math.log2(BANKS)) if pow2 else 0
-for i in range(BANKS):
-    if mapping == "modulo":
-        # Each bank owns a contiguous range; the accelerator's bank-select
-        # logic maps 8-byte word w to bank w % BANKS, row w // BANKS.
-        rng = AddrRange(SPM_BASE + i * bank_bytes, size=bank_bytes)
-    elif bits:
-        rng = AddrRange(SPM_BASE, size=spm_size, intlvHighBit=2 + bits,
-                        intlvBits=bits, intlvMatch=i)
-    else:
-        rng = AddrRange(SPM_BASE, size=spm_size)
-    banks.append(SimpleMemory(range=rng, latency=f"{lat_ns}ns",
-                              latency_var="0ns", bandwidth=bank_bw,
-                              clk_domain=system.accel_clk_domain))
-system.spm = banks
+
+
+def make_banks(base):
+    banks = []
+    for i in range(BANKS):
+        if mapping == "modulo":
+            # Each bank owns a contiguous range; the accelerator's bank-select
+            # logic maps 8-byte word w to bank w % BANKS, row w // BANKS.
+            rng = AddrRange(base + i * bank_bytes, size=bank_bytes)
+        elif bits:
+            rng = AddrRange(base, size=spm_size, intlvHighBit=2 + bits,
+                            intlvBits=bits, intlvMatch=i)
+        else:
+            rng = AddrRange(base, size=spm_size)
+        banks.append(SimpleMemory(range=rng, latency=f"{lat_ns}ns",
+                                  latency_var="0ns", bandwidth=bank_bw,
+                                  clk_domain=system.accel_clk_domain))
+    return banks
+
+
+system.spm = make_banks(SPM_BASE)
 for b in system.spm:
     b.port = system.spm_xbar.mem_side_ports
+# 1r1w: each bank is two SimpleMemory objects, a write port (system.spm, the
+# one that holds the layout above) and a read port (system.spm_rd, the same
+# layout at an alias).  They contend for nothing, so a read and a write of
+# one bank go through in the same cycle, each with the usual latency.  The
+# accelerator keeps the copies identical.
+spm_alias = 0
+if args.bank_ports == "1r1w":
+    spm_alias = 1 << math.ceil(math.log2(spm_size))
+    system.spm_rd = make_banks(SPM_BASE + spm_alias)
+    for b in system.spm_rd:
+        b.port = system.spm_xbar.mem_side_ports
 
 # Accelerator
 system.accel = SystolicAccel(
@@ -367,7 +533,18 @@ system.accel = SystolicAccel(
     max_cycles=args.max_cycles,
     spm_banks=BANKS, bank_mapping=mapping, arbitration=args.arbitration,
     bank_policy=args.bank_policy,
+    stall_model=args.stall_model, bank_ports=args.bank_ports,
+    spm_read_alias=spm_alias, weight_store=args.weight_store,
+    bank_hash=args.bank_hash, m_tile=m_tile, n_tile=n_tile,
+    psum_rmw=args.psum_rmw, psum_store=args.psum_store,
+    bank_trace_file=args.bank_trace,
 )
+if args.prepacked_weights:
+    prepacked = os.path.join(wdir, f"W_packed_N{N}.bin")
+    if not os.path.exists(prepacked):
+        fail(f"{prepacked} not found; run: make prepacked")
+    system.accel.w_prepacked_file = prepacked
+    system.accel.w_prepacked_addr = shared_pa + align(M * K, 4096)
 if not host:
     system.accel.gemm_m = M
     system.accel.gemm_k = K
@@ -376,7 +553,7 @@ if not host:
     system.accel.w_file = w_file
     system.accel.c_golden_file = c_file
 if args.arbitration == "bank":
-    nports = BANKS
+    nports = BANKS * (2 if args.bank_ports == "1r1w" else 1)
 else:
     nports = N // 8 + N // 8 + N // 2 + args.dma_lanes
 for i in range(nports):
@@ -406,7 +583,16 @@ run_info = {
     "ideal_spm": args.ideal_spm,
     "ideal_dram": args.ideal_dram, "host_driven": host,
     "mode": args.mode if host else "standalone",
-    "layer_dump": 1 if host else 0, "psum_queue": args.psum_queue,
+    "layer_dump": (2 if args.split_host_stats else 1) if host else 0,
+    "psum_queue": args.psum_queue,
+    "stall_model": args.stall_model, "bank_ports": args.bank_ports,
+    "weight_store": args.weight_store, "bank_hash": args.bank_hash,
+    "spm_depth": args.spm_depth, "m_tile": m_tile, "n_tile": n_tile,
+    "psum_rmw": args.psum_rmw, "psum_store": args.psum_store,
+    "spm_required_bytes": need, "spm_capacity_bytes": capacity or spm_size,
+    "split_host_stats": args.split_host_stats,
+    "prepacked_weights": args.prepacked_weights,
+    "membus_width": args.membus_width,
     "weight_slots": slots, "clock_hz": freq,
     "cpu_clock_hz": toFrequency(args.cpu_clock),
     "mem_type": args.mem_type, "dram_peak_bps": dram_peak_bps,
