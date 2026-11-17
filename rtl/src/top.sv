@@ -58,167 +58,34 @@ module top #(
   logic signed [N-1:0][N-1:0][31:0]  partial_sums;  // N * N * 8-bit partial sum array 
   logic [N-1:0][N-1:0][7:0]  x_pipeline;    // N * N * 8-bit x array    
 
-  logic all_banks_valid;
-
   logic [N-1:0][7:0] buffer_input;
 
-  integer group_count;
-  integer chunk_count;
-  integer run_count;
-  integer drain_count;
-
-  // need new FSM: IDLE, LOAD_WEIGHTS, SWAP_WEIGHTS, LOAD_INPUTS, RUN, DONE
-   //-------------------------------------------------------------------------//
-  // TODO controller: (current SRAM control needs replacement)
-  // - needs to load weights register after reset
-  // - needs to load activation weights and stall if necessary
   //-------------------------------------------------------------------------//
-  typedef enum logic [2:0] {
-    IDLE,
-    LOAD_WEIGHTS,
-    SWAP_WEIGHTS,
-    LOAD_INPUTS,
-    RUN,
-    DRAIN,
-    DONE
-  } state_t;
-
-  state_t state, next_state;
-
-  localparam integer DRAIN_CYCLES = N - 1;//(2 * N) - 2;
-  assign all_banks_valid = &weight_valid;
-
-  assign sram_en = (state == LOAD_WEIGHTS) && !all_banks_valid;
-
-  assign sram_addr =(group_count * WORDS_PER_COLUMN) + chunk_count;
-
-  always_ff @(posedge CLK or negedge RST_N) begin
-
-    if (!RST_N) begin
-
-      state <= IDLE;
-      group_count <= 0;
-      chunk_count <= 0;
-      run_count   <= 0;
-      drain_count <= 0;
-      stall_count  <= '0;
-      active_count <= '0;
-
-    end else begin
-      state <= next_state;
-      // advance the weight-loading counters when SRAM data is valid
-      if (EN) begin
-        if (stall)
-          stall_count <= stall_count + 1'b1;
-        else if (state == RUN && mac_en)
-          active_count <= active_count + 1'b1;
-      end
-      
-      if ((state == LOAD_WEIGHTS) && all_banks_valid) begin
-        if (chunk_count == WORDS_PER_COLUMN - 1) begin
-          chunk_count <= 0;
-          if (group_count == COLUMNS_PER_BANK - 1)
-            group_count <= 0;
-          else
-            group_count <= group_count + 1;
-        end else begin
-          chunk_count <= chunk_count + 1;
-        end
-      end
-
-      if (state == LOAD_INPUTS)
-        run_count <= 0; // reset activation counter before starting a tile
-
-      else if ((state == RUN) && EN)
-        run_count <= run_count + 1;
-
-      if ((state == RUN) && (next_state == DRAIN))
-        drain_count <= 0; // drain after the final activation cycle
-
-      else if ((state == DRAIN) && EN)
-        drain_count <= drain_count + 1; // cycles to flush the pipeline
-    end
-  end
-
-  always_comb begin
-    next_state = state;
-    mac_en = 1'b0;
-    input_buffer_en = 1'b0;
-    stall = 1'b0;
-    w_load = '0;
-    w_swap = '0;
-    w_data = '0;
-    buffer_input = '0;
-
-    case (state)
-      IDLE: begin
-        if (EN)
-          next_state = LOAD_WEIGHTS;
-      end
-
-      LOAD_WEIGHTS: begin
-        stall = 1'b1;
-        if (all_banks_valid) begin
-          for (integer b = 0; b < BANKS; b = b + 1) begin
-            // column assigned to this bank for the current group
-            if ((group_count * BANKS + b) < N) begin
-              for (integer lane = 0; lane < 8; lane = lane + 1) begin
-                // row assigned to this byte lane
-                if ((chunk_count * 8 + lane) < N) begin
-                  w_data[group_count * BANKS + b]
-                        [chunk_count * 8 + lane]
-                      = rd_data[b][lane * 8 +: 8];
-                  w_load[group_count * BANKS + b]
-                        [chunk_count * 8 + lane] = 1'b1;
-                end
-              end
-            end
-          end
-          // check whether all column groups and chunks have been loaded
-          if ((group_count == COLUMNS_PER_BANK - 1) &&
-              (chunk_count == WORDS_PER_COLUMN - 1))
-            next_state = SWAP_WEIGHTS;
-        end
-      end
-
-      SWAP_WEIGHTS: begin // move staging weights into active MAC weight registers
-        w_swap = '1;
-        next_state = LOAD_INPUTS;
-      end
-
-      LOAD_INPUTS: begin // prepare to feed activations into the skew buffer
-        next_state = RUN;
-      end
-
-      RUN: begin // process M activation cycles
-
-        mac_en = EN;
-        input_buffer_en = EN;
-        buffer_input = ACTIVATION_IN;
-        if (EN && (run_count == M - 1))
-          next_state = DRAIN;
-      end
-
-      DRAIN: begin //flush remaining activations and partial sums through the array
-
-        mac_en = EN;
-        input_buffer_en = EN;
-        // Feed zeros so the remaining pipeline values can propagate
-        buffer_input = '0;
-        if (EN && (drain_count == DRAIN_CYCLES - 1))
-          next_state = DONE;
-      end
-
-      DONE: begin
-        if (!EN)
-          next_state = IDLE;
-      end
-
-      default: begin
-        next_state = IDLE;
-      end
-    endcase
-  end
+  // controller: loads weights from SRAM, swaps them in, then runs the array
+  //-------------------------------------------------------------------------//
+  controller #(
+    .N     (N),
+    .M     (M),
+    .BANKS (BANKS)
+  ) controller_u (
+    .CLK             (CLK),
+    .RST_N           (RST_N),
+    .EN              (EN),
+    .ACTIVATION_IN   (ACTIVATION_IN),
+    .weight_valid    (weight_valid),
+    .rd_data         (rd_data),
+    .sram_en         (sram_en),
+    .sram_addr       (sram_addr),
+    .mac_en          (mac_en),
+    .w_load          (w_load),
+    .w_swap          (w_swap),
+    .w_data          (w_data),
+    .input_buffer_en (input_buffer_en),
+    .buffer_input    (buffer_input),
+    .stall           (stall),
+    .stall_count     (stall_count),
+    .active_count    (active_count)
+  );
 
 
   //-------------------------------------------------------------------------//
@@ -226,7 +93,7 @@ module top #(
   //-------------------------------------------------------------------------//
   input_buffer #(
     .N     (N)
-  )(   
+  ) input_buffer_u (
     .CLK   (CLK),   
     .RST_N (RST_N), 
     .EN    (input_buffer_en),    

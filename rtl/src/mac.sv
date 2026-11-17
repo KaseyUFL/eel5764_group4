@@ -7,6 +7,7 @@
 // Group       : #4                                                          //
 // Description : MAC (Multiply-Accumulate) unit                              //
 //---------------------------------------------------------------------------//
+(* use_dsp = "yes" *)
 module mac (   
   input  logic       CLK,   // clock
   input  logic       RST_N, // reset (active low)
