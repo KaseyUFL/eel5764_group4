@@ -11,6 +11,7 @@ module top #(
   parameter N     = 8, // input depth (number of MACs squared)
   parameter M = 8,
   parameter BANKS = 8,  // bank count (number of SRAM banks)
+  parameter DOUBLE_BUFFER = 1, // 1 = load the next tile's weights while the array is running
   parameter WORDS_PER_COLUMN = (N + 7) / 8,
   parameter COLUMNS_PER_BANK = (N + BANKS - 1) / BANKS,
   parameter SRAM_DEPTH = WORDS_PER_COLUMN * COLUMNS_PER_BANK,
@@ -20,6 +21,8 @@ module top #(
   input  logic                   CLK,      // clock
   input  logic                   RST_N,    // reset (active low)
   input  logic                   EN,       // enable
+  input  logic                   WEIGHTS_READY, // host has written a new tile into the SRAM
+  output logic                   weights_taken, // controller is done reading the SRAM
   input logic [N-1:0][7:0] ACTIVATION_IN, // input_buffer activation
   output logic signed [N-1:0][31:0] ARRAY_OUT, // array outputs (BANKS * 8 bytes)
 
@@ -66,11 +69,14 @@ module top #(
   controller #(
     .N     (N),
     .M     (M),
-    .BANKS (BANKS)
+    .BANKS (BANKS),
+    .DOUBLE_BUFFER (DOUBLE_BUFFER)
   ) controller_u (
     .CLK             (CLK),
     .RST_N           (RST_N),
     .EN              (EN),
+    .WEIGHTS_READY   (WEIGHTS_READY),
+    .weights_taken   (weights_taken),
     .ACTIVATION_IN   (ACTIVATION_IN),
     .weight_valid    (weight_valid),
     .rd_data         (rd_data),
