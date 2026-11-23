@@ -1,0 +1,13 @@
+# Python packages for the workload generator, the analysis and the plots:
+#   make venv          (installs them into .venv, which the scripts then use)
+#   or: pip install -r requirements.txt   into a Python of your choice
+#
+# Pinned to the versions the published results were made with, so that a
+# rerun rewrites results/ byte for byte.  Newer versions also work: the
+# numbers then agree to within floating-point round-off (make check says
+# so) and some PDF bytes may differ.  Tested with Python 3.14.
+numpy==2.4.6
+pyyaml==6.0.3
+pandas==3.0.3
+matplotlib==3.11.0
+tabulate==0.10.0    # tables as Markdown

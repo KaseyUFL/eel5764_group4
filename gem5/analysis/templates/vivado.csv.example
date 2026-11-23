@@ -1,0 +1,5 @@
+N,banks,fmax_mhz,array_power_w,bram_energy_pj_per_access
+8,8,,,
+16,16,,,
+24,16,,,
+32,32,,,

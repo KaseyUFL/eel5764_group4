@@ -1,0 +1,3 @@
+workload,N,banks,cycles
+bert_attn_qk_rtl,8,8,12500
+bert_attn_qk_rtl,16,8,6100

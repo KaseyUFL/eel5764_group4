@@ -1,0 +1,17 @@
+# Generated; rebuilt by make (see README.md)
+/results/
+/build/
+/third_party/
+/workloads/out/
+/gem5_model/host/systolic_host
+/gem5_model/host/systolic_host_ext
+
+# Machine-specific settings (copy env.local.sh.example)
+/env.local.sh
+/.venv/
+
+# gem5 output from runs made outside build/
+m5out*/
+
+__pycache__/
+*.pyc

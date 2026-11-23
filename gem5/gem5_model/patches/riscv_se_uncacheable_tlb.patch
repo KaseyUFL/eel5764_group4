@@ -1,0 +1,24 @@
+diff --git a/src/arch/riscv/tlb.cc b/src/arch/riscv/tlb.cc
+index 7664395e27..b428e5d0e0 100644
+--- a/src/arch/riscv/tlb.cc
++++ b/src/arch/riscv/tlb.cc
+@@ -599,12 +599,15 @@ TLB::translate(const RequestPtr &req, ThreadContext *tc,
+          * need to ignore the upper bits beyond 32 bits.
+          */
+         Addr vaddr = getValidAddr(req->getVaddr(), tc, mode);
+-        Addr paddr;
+-
+-        if (!p->pTable->translate(vaddr, paddr))
++        const EmulationPageTable::Entry *pte = p->pTable->lookup(vaddr);
++        if (!pte)
+             return std::make_shared<GenericPageTableFault>(req->getVaddr());
+ 
+-        req->setPaddr(paddr);
++        req->setPaddr(pte->paddr + p->pTable->pageOffset(vaddr));
++        // Honour Process::map(..., cacheable=False), as x86 does, so an SE
++        // program can reach memory-mapped device registers uncached.
++        if (pte->flags & EmulationPageTable::Uncacheable)
++            req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
+ 
+         return NoFault;
+     }
